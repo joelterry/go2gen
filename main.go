@@ -6,7 +6,9 @@ import (
 	"go/ast"
 	"go/build"
 	"go/format"
+	"go/importer"
 	"go/parser"
+	"go/scanner"
 	"go/token"
 	"go/types"
 	"io/ioutil"
@@ -25,28 +27,6 @@ const (
 	errorPrefix = "_go2err"
 	extension   = ".go2"
 )
-
-type callMap map[*ast.Ident]types.Object
-
-func (cm callMap) resultCount(call *ast.CallExpr) (int, error) {
-	ident, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		lit, ok := call.Fun.(*ast.FuncLit)
-		if !ok {
-			return 0, errors.New("callMap: CallExpr.Fun not Ident or FuncLit")
-		}
-		return len(lit.Type.Results.List), nil
-	}
-	obj, ok := cm[ident]
-	if !ok {
-		return 0, errors.New("callMap: object not found")
-	}
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return 0, errors.New("callMap: object not function")
-	}
-	return sig.Results().Len(), nil
-}
 
 func main() {
 	dir := "foo"
@@ -75,6 +55,55 @@ func main() {
 	}
 }
 
+type callMap map[*ast.Ident]types.Object
+
+func (cm callMap) resultCount(call *ast.CallExpr) (int, error) {
+	ident, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		lit, ok := call.Fun.(*ast.FuncLit)
+		if !ok {
+			return 0, errors.New("callMap: CallExpr.Fun not Ident or FuncLit")
+		}
+		return len(lit.Type.Results.List), nil
+	}
+	obj, ok := cm[ident]
+	if !ok {
+		return 0, errors.New("callMap: object not found")
+	}
+	sig, ok := obj.Type().(*types.Signature)
+	if !ok {
+		return 0, errors.New("callMap: object not function")
+	}
+	return sig.Results().Len(), nil
+}
+
+type argMap map[ast.Node][][]string
+
+func (am argMap) add(node ast.Node, vars []string) {
+	if len(vars) == 0 {
+		return
+	}
+	am[node] = append(am[node], vars)
+}
+
+func (am argMap) get(node ast.Node) ([]string, error) {
+	parts := am[node]
+	if len(parts) == 0 {
+		return []string{}, nil
+	}
+	if len(parts) == 1 {
+		return parts[0], nil
+	}
+	var all []string
+	for _, part := range parts {
+		if len(part) > 1 {
+			return nil, errors.New("error: more than one multiple return")
+		}
+		all = append(all, part...)
+	}
+	return all, nil
+}
+
 type converter struct {
 	numVals int
 	numErrs int
@@ -82,39 +111,31 @@ type converter struct {
 
 func (cv *converter) convertAST(node ast.Node, cm callMap) error {
 
-	// my guess for rules in passing this up:
-	//   if parent is expr, continue passing up
-	//   if parent is stmt, insert checks behind, and clear them
-	var checks []ast.Node
-
+	codeStacks := make(map[ast.Stmt][][]ast.Node)
+	am := make(argMap)
+	var currStmt ast.Stmt
 	var applyErr error
-	astutil.Apply(node, nil, func(c *astutil.Cursor) bool {
-		if _, ok := c.Node().(ast.Stmt); ok {
-			for _, checkNode := range checks {
-				c.InsertBefore(checkNode)
-			}
-			// TODO: if checks exist, replace right side with
-			// respective variables... store them on parent with map?
-			//
-			// ALSO need to do same with expr parents...
-			checks = nil
+
+	preorder := func(c *astutil.Cursor) bool {
+		if stmt, ok := c.Node().(ast.Stmt); ok {
+			currStmt = stmt
+			return true
 		}
 
-		call, ok := c.Node().(*ast.CallExpr)
+		call, ok := checkNode(c.Node())
 		if !ok {
 			return true
 		}
-		ident, ok := call.Fun.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		if ident.Name != checkFunc {
-			return true
-		}
-		if len(call.Args) != 1 {
-			applyErr = errors.New("invalid check call")
+		_, ok = checkNode(c.Parent())
+		if ok {
+			applyErr = errors.New("error: directly nested checks")
 			return false
 		}
+		if len(call.Args) != 1 {
+			applyErr = errors.New("invalid check")
+			return false
+		}
+
 		expr := call.Args[0]
 
 		numResults := 1
@@ -122,6 +143,16 @@ func (cv *converter) convertAST(node ast.Node, cm callMap) error {
 		if ok {
 			numResults, applyErr = cm.resultCount(innerCall)
 			if applyErr != nil {
+				return false
+			}
+		}
+		if numResults == 0 {
+			applyErr = errors.New("check on func with no return values")
+			return false
+		}
+		if numResults == 1 {
+			if _, ok := c.Parent().(*ast.ExprStmt); !ok {
+				applyErr = errors.New("check expression with single value must be an expression statement")
 				return false
 			}
 		}
@@ -134,13 +165,78 @@ func (cv *converter) convertAST(node ast.Node, cm callMap) error {
 		vals = append(vals, errorPrefix+strconv.Itoa(cv.numErrs))
 		cv.numErrs++
 
-		checks = append(checks, checkToNodes(expr, vals)...)
+		// don't include error
+		am.add(c.Parent(), vals[:len(vals)-1])
+
+		// currStmt shouldn't be nil at this point
+		codeStacks[currStmt] = append(codeStacks[currStmt], checkToNodes(expr, vals))
 
 		c.Replace(expr)
-
 		return true
-	})
+	}
+
+	postorder := func(c *astutil.Cursor) bool {
+		node := c.Node()
+
+		args, err := am.get(node)
+		if err != nil {
+			applyErr = err
+			return false
+		}
+		if len(args) > 0 {
+			exprs := make([]ast.Expr, len(args))
+			for i, arg := range args {
+				exprs[i] = &ast.Ident{Name: arg}
+			}
+			replaceArgs(node, exprs)
+		}
+
+		stmt, ok := node.(ast.Stmt)
+		if !ok {
+			return true
+		}
+		stack := codeStacks[stmt]
+		for i := len(stack) - 1; i >= 0; i-- {
+			nodes := stack[i]
+			for _, node := range nodes {
+				c.InsertBefore(node)
+			}
+		}
+		return true
+	}
+
+	astutil.Apply(node, preorder, postorder)
 	return applyErr
+}
+
+func replaceArgs(node ast.Node, args []ast.Expr) error {
+	switch v := node.(type) {
+	case *ast.CallExpr:
+		v.Args = args
+	case *ast.AssignStmt:
+		v.Rhs = args
+	default:
+		return fmt.Errorf("node type not supported by replaceArgs: %v", v)
+	}
+	return nil
+}
+
+func checkNode(node ast.Node) (*ast.CallExpr, bool) {
+	if node == nil {
+		return nil, false
+	}
+	call, ok := node.(*ast.CallExpr)
+	if !ok {
+		return nil, false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	if ident.Name != checkFunc {
+		return nil, false
+	}
+	return call, true
 }
 
 func checkToNodes(expr ast.Expr, vals []string) []ast.Node {
@@ -172,7 +268,7 @@ func checkToNodes(expr ast.Expr, vals []string) []ast.Node {
 			Cond: &ast.BinaryExpr{
 				X:  errIdent,
 				Op: token.NEQ,
-				Y:  errIdent,
+				Y:  &ast.Ident{Name: "nil"},
 			},
 			Body: &ast.BlockStmt{
 				List: []ast.Stmt{
@@ -185,7 +281,7 @@ func checkToNodes(expr ast.Expr, vals []string) []ast.Node {
 	}
 }
 
-func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, map[*ast.Ident]types.Object, error) {
+func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, callMap, error) {
 	pkg, err := build.ImportDir(dirPath, 0)
 	if err != nil {
 		return nil, nil, err
@@ -253,7 +349,8 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, map[*a
 	}
 
 	cfg := &types.Config{
-		Error: func(err error) { log.Println(err) },
+		Error:    func(err error) { log.Println(err) },
+		Importer: importer.Default(),
 	}
 	info := &types.Info{
 		Uses: make(callMap),
@@ -263,96 +360,74 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, map[*a
 	return fm, info.Uses, nil
 }
 
-func indexExprEnd(s string) (int, error) {
-	var parens, braces, brackets int
-	for i, r := range s {
-		switch r {
-		case '(':
-			parens++
-		case '{':
-			braces++
-		case '[':
-			brackets++
-		case ')':
-			parens--
-		case '}':
-			braces--
-		case ']':
-			brackets--
-		case '\n', ';':
-			if parens+braces+brackets == 0 {
-				return i, nil
+func replaceChecks(src string) (string, error) {
+	// https://golang.org/pkg/go/scanner/#Scanner.Scan
+	var sc scanner.Scanner
+	fset := token.NewFileSet()
+	file := fset.AddFile("", fset.Base(), len(src))
+	sc.Init(file, []byte(src), nil, 0)
+
+	var sb strings.Builder
+
+	var delimiterStack [][3]int
+	const (
+		parens   = 0
+		brackets = 1
+		braces   = 2
+	)
+	di := map[token.Token]int{
+		token.LPAREN: parens,
+		token.RPAREN: parens,
+		token.LBRACK: brackets,
+		token.RBRACK: brackets,
+		token.LBRACE: braces,
+		token.RBRACE: braces,
+	}
+
+	for {
+		_, tok, lit := sc.Scan()
+		if tok == token.EOF {
+			break
+		}
+
+		if lit == "check" {
+			sb.WriteString(checkFunc + " ( ")
+			delimiterStack = append(delimiterStack, [3]int{})
+			continue
+		}
+
+		if len(delimiterStack) > 0 {
+			top := len(delimiterStack) - 1
+
+			switch tok {
+			case token.LPAREN, token.LBRACK, token.LBRACE:
+				delimiterStack[top][di[tok]]++
+			case token.RPAREN, token.RBRACK, token.RBRACE:
+				delimiterStack[top][di[tok]]--
+				if delimiterStack[top] == [3]int{} {
+					sb.WriteString(") ")
+					delimiterStack = delimiterStack[:top]
+				}
+			default:
+				if tok.IsOperator() && delimiterStack[top] == [3]int{} {
+					sb.WriteString(") ")
+					delimiterStack = delimiterStack[:top]
+				}
 			}
 		}
-		if parens < 0 || braces < 0 || brackets < 0 {
-			return 0, fmt.Errorf("invalid syntax:\n%s", s[:i+1])
+
+		switch {
+		case tok.IsOperator() || tok.IsKeyword():
+			sb.WriteString(tok.String())
+		default:
+			sb.WriteString(lit)
 		}
-	}
-	if parens+braces+brackets == 0 {
-		return len(s), nil
-	}
-	return 0, fmt.Errorf("expression not found")
-}
-
-func consume(s, chars string) string {
-	for i := range s {
-		if !strings.ContainsAny(s[i:i+1], chars) {
-			return s[i:]
-		}
-	}
-	return ""
-}
-
-func replaceChecks(src string) (string, error) {
-	var sb strings.Builder
-
-	checkI := strings.Index(src, "check ")
-	for ; checkI >= 0; checkI = strings.Index(src, "check ") {
-		sb.WriteString(src[:checkI])
-
-		src = src[checkI+6:]
-
-		exprEnd, err := indexExprEnd(src)
-		if err != nil {
-			return "", err
-		}
-
-		sb.WriteString(checkFunc + "(")
-
-		arg, err := replaceChecks(src[:exprEnd])
-		if err != nil {
-			return "", err
-		}
-
-		sb.WriteString(arg)
-		sb.WriteString(")")
-
-		src = src[exprEnd:]
+		sb.WriteString(" ")
 	}
 
-	sb.WriteString(src)
-
-	return sb.String(), nil
-}
-
-func removeChecks(src string) (string, error) {
-	var sb strings.Builder
-
-	checkI := strings.Index(src, "check ")
-	for ; checkI >= 0; checkI = strings.Index(src, "check ") {
-		sb.WriteString(src[:checkI])
-
-		src = src[checkI+6:]
-
-		exprEnd, err := indexExprEnd(src)
-		if err != nil {
-			return "", err
-		}
-
-		src = consume(src[exprEnd:], ";\n\t ")
+	if len(delimiterStack) > 0 {
+		return "", errors.New("scan error")
 	}
-
-	sb.WriteString(src)
 
 	return sb.String(), nil
 }
