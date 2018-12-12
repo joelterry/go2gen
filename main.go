@@ -8,7 +8,6 @@ import (
 	"go/format"
 	"go/importer"
 	"go/parser"
-	"go/scanner"
 	"go/token"
 	"go/types"
 	"io/ioutil"
@@ -16,13 +15,14 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
 )
 
 const (
 	checkFunc   = "_go2check"
+	handleBool  = "_go2handle"
+	handleErr   = "_go2handleErr"
 	valuePrefix = "_go2val"
 	errorPrefix = "_go2err"
 	extension   = ".go2"
@@ -336,7 +336,7 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, callMa
 		if err != nil {
 			return nil, nil, err
 		}
-		src, err := replaceChecks(string(b))
+		src, err := RewriteChecksAndHandles(string(b))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -358,76 +358,4 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, callMa
 	cfg.Check(pkg.Name, fset, fs, info)
 
 	return fm, info.Uses, nil
-}
-
-func replaceChecks(src string) (string, error) {
-	// https://golang.org/pkg/go/scanner/#Scanner.Scan
-	var sc scanner.Scanner
-	fset := token.NewFileSet()
-	file := fset.AddFile("", fset.Base(), len(src))
-	sc.Init(file, []byte(src), nil, 0)
-
-	var sb strings.Builder
-
-	var delimiterStack [][3]int
-	const (
-		parens   = 0
-		brackets = 1
-		braces   = 2
-	)
-	di := map[token.Token]int{
-		token.LPAREN: parens,
-		token.RPAREN: parens,
-		token.LBRACK: brackets,
-		token.RBRACK: brackets,
-		token.LBRACE: braces,
-		token.RBRACE: braces,
-	}
-
-	for {
-		_, tok, lit := sc.Scan()
-		if tok == token.EOF {
-			break
-		}
-
-		if lit == "check" {
-			sb.WriteString(checkFunc + " ( ")
-			delimiterStack = append(delimiterStack, [3]int{})
-			continue
-		}
-
-		if len(delimiterStack) > 0 {
-			top := len(delimiterStack) - 1
-
-			switch tok {
-			case token.LPAREN, token.LBRACK, token.LBRACE:
-				delimiterStack[top][di[tok]]++
-			case token.RPAREN, token.RBRACK, token.RBRACE:
-				delimiterStack[top][di[tok]]--
-				if delimiterStack[top] == [3]int{} {
-					sb.WriteString(") ")
-					delimiterStack = delimiterStack[:top]
-				}
-			default:
-				if tok.IsOperator() && delimiterStack[top] == [3]int{} {
-					sb.WriteString(") ")
-					delimiterStack = delimiterStack[:top]
-				}
-			}
-		}
-
-		switch {
-		case tok.IsOperator() || tok.IsKeyword():
-			sb.WriteString(tok.String())
-		default:
-			sb.WriteString(lit)
-		}
-		sb.WriteString(" ")
-	}
-
-	if len(delimiterStack) > 0 {
-		return "", errors.New("scan error")
-	}
-
-	return sb.String(), nil
 }
