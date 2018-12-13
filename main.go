@@ -20,12 +20,14 @@ import (
 )
 
 const (
-	checkFunc   = "_go2check"
-	handleBool  = "_go2handle"
-	handleErr   = "_go2handleErr"
-	valuePrefix = "_go2val"
-	errorPrefix = "_go2err"
-	extension   = ".go2"
+	checkFunc          = "_go2check"
+	handleBool         = "_go2handle"
+	handleErr          = "_go2handleErr"
+	valuePrefix        = "_go2val"
+	varPrefix          = "_go2var"
+	errorPrefix        = "_go2err"
+	handleResultPrefix = "_go2r"
+	extension          = ".go2"
 )
 
 func main() {
@@ -37,7 +39,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	cv := &converter{}
+	cv := &converterOld{}
 
 	for name, f := range fm {
 		err := cv.convertAST(f, cm)
@@ -53,28 +55,6 @@ func main() {
 			panic(err)
 		}
 	}
-}
-
-type callMap map[*ast.Ident]types.Object
-
-func (cm callMap) resultCount(call *ast.CallExpr) (int, error) {
-	ident, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		lit, ok := call.Fun.(*ast.FuncLit)
-		if !ok {
-			return 0, errors.New("callMap: CallExpr.Fun not Ident or FuncLit")
-		}
-		return len(lit.Type.Results.List), nil
-	}
-	obj, ok := cm[ident]
-	if !ok {
-		return 0, errors.New("callMap: object not found")
-	}
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return 0, errors.New("callMap: object not function")
-	}
-	return sig.Results().Len(), nil
 }
 
 type argMap map[ast.Node][][]string
@@ -104,29 +84,35 @@ func (am argMap) get(node ast.Node) ([]string, error) {
 	return all, nil
 }
 
-type converter struct {
+type converterOld struct {
 	numVals int
 	numErrs int
 }
 
-func (cv *converter) convertAST(node ast.Node, cm callMap) error {
+func (cv *converterOld) convertAST(node ast.Node, cm callMap) error {
 
 	codeStacks := make(map[ast.Stmt][][]ast.Node)
 	am := make(argMap)
+	var handleBlocks []*ast.BlockStmt
 	var currStmt ast.Stmt
 	var applyErr error
 
 	preorder := func(c *astutil.Cursor) bool {
+		if h, ok := toHandleBlock(c.Node()); ok {
+			handleBlocks = append(handleBlocks, h)
+			return true
+		}
+
 		if stmt, ok := c.Node().(ast.Stmt); ok {
 			currStmt = stmt
 			return true
 		}
 
-		call, ok := checkNode(c.Node())
+		call, ok := toCheckCall(c.Node())
 		if !ok {
 			return true
 		}
-		_, ok = checkNode(c.Parent())
+		_, ok = toCheckCall(c.Parent())
 		if ok {
 			applyErr = errors.New("error: directly nested checks")
 			return false
@@ -219,24 +205,6 @@ func replaceArgs(node ast.Node, args []ast.Expr) error {
 		return fmt.Errorf("node type not supported by replaceArgs: %v", v)
 	}
 	return nil
-}
-
-func checkNode(node ast.Node) (*ast.CallExpr, bool) {
-	if node == nil {
-		return nil, false
-	}
-	call, ok := node.(*ast.CallExpr)
-	if !ok {
-		return nil, false
-	}
-	ident, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		return nil, false
-	}
-	if ident.Name != checkFunc {
-		return nil, false
-	}
-	return call, true
 }
 
 func checkToNodes(expr ast.Expr, vals []string) []ast.Node {
@@ -348,6 +316,7 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, callMa
 		fm[name] = f
 	}
 
+	// https://github.com/golang/example/tree/master/gotypes#identifier-resolution
 	cfg := &types.Config{
 		Error:    func(err error) { log.Println(err) },
 		Importer: importer.Default(),

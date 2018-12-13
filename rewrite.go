@@ -166,9 +166,6 @@ func (rw *rewriter) stateCheck() {
 }
 
 func (rw *rewriter) stateHandle() {
-	rw.write(token.IF, "if")
-	rw.write(token.IDENT, handleBool)
-
 	tok, lit := rw.scan()
 	if tok != token.IDENT {
 		panic(errors.New("expected identifier after handle"))
@@ -180,6 +177,10 @@ func (rw *rewriter) stateHandle() {
 	if tok != token.LBRACE {
 		panic(errors.New("expected left brace after 'handle IDENT'"))
 	}
+
+	rw.write(token.IF, "if")
+	rw.write(token.IDENT, handleBool)
+	rw.write(token.LBRACE, "{")
 
 	dc := delimCounter{}
 	dc.count(token.LBRACE)
@@ -214,76 +215,4 @@ func (rw *rewriter) stateHandle() {
 			break
 		}
 	}
-}
-
-func replaceChecksOld(src string) (string, error) {
-	// https://golang.org/pkg/go/scanner/#Scanner.Scan
-	var sc scanner.Scanner
-	fset := token.NewFileSet()
-	file := fset.AddFile("", fset.Base(), len(src))
-	sc.Init(file, []byte(src), nil, 0)
-
-	var sb strings.Builder
-
-	var delimiterStack [][3]int
-	const (
-		parens   = 0
-		brackets = 1
-		braces   = 2
-	)
-	di := map[token.Token]int{
-		token.LPAREN: parens,
-		token.RPAREN: parens,
-		token.LBRACK: brackets,
-		token.RBRACK: brackets,
-		token.LBRACE: braces,
-		token.RBRACE: braces,
-	}
-
-	for {
-		_, tok, lit := sc.Scan()
-		if tok == token.EOF {
-			break
-		}
-
-		if lit == "check" {
-			sb.WriteString(checkFunc + " ( ")
-			delimiterStack = append(delimiterStack, [3]int{})
-			continue
-		}
-
-		if len(delimiterStack) > 0 {
-			top := len(delimiterStack) - 1
-
-			switch tok {
-			case token.LPAREN, token.LBRACK, token.LBRACE:
-				delimiterStack[top][di[tok]]++
-			case token.RPAREN, token.RBRACK, token.RBRACE:
-				delimiterStack[top][di[tok]]--
-				if delimiterStack[top] == [3]int{} {
-					sb.WriteString(") ")
-					delimiterStack = delimiterStack[:top]
-				}
-			default:
-				if tok.IsOperator() && delimiterStack[top] == [3]int{} {
-					sb.WriteString(") ")
-					delimiterStack = delimiterStack[:top]
-				}
-			}
-		}
-
-		switch {
-		case tok.IsOperator() || tok.IsKeyword():
-			sb.WriteString(tok.String())
-		default:
-			sb.WriteString(lit)
-		}
-		sb.WriteString(" ")
-	}
-
-	if len(delimiterStack) > 0 {
-		return "", errors.New("scan error")
-	}
-
-	return sb.String(), nil
 }
