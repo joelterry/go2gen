@@ -83,13 +83,7 @@ func (cv *converter) convertFile(f *ast.File) {
 }
 
 func (cv *converter) convertFunc(ft *ast.FuncType, body *ast.BlockStmt) {
-	top, bottom := handleTopAndBottom(ft)
-	var hc handlerChain
-	for _, stmt := range top {
-		hc.top = append(hc.top, stmt)
-	}
-	hc.bottom = bottom
-	cv.convertBlock(hc, body)
+	cv.convertBlock(newHandlerChain(ft), body)
 }
 
 func (cv *converter) convertBlock(hc handlerChain, block *ast.BlockStmt) {
@@ -104,6 +98,7 @@ func (cv *converter) convertBlock(hc handlerChain, block *ast.BlockStmt) {
 		newList = append(newList, generated...)
 		newList = append(newList, stmt)
 	}
+	block.List = newList
 }
 
 // Unlike the above convert* funcs, convertStmt and convertExprs
@@ -145,11 +140,41 @@ func (cv *converter) convertStmt(hc handlerChain, stmt ast.Stmt) []ast.Stmt {
 	switch v := stmt.(type) {
 	// TODO: fill these out
 	case *ast.DeclStmt:
+		genDecl, ok := v.Decl.(*ast.GenDecl)
+		if !ok {
+			return nil
+		}
+		switch genDecl.Tok {
+		case token.VAR, token.CONST:
+			for _, spec := range genDecl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				gen, newExprs := cv.convertExprs(hc, valueSpec.Values)
+				valueSpec.Values = newExprs
+				return gen
+			}
+		default:
+			return nil
+		}
 	case *ast.ExprStmt:
+		gen, newExpr := cv.convertExpr(hc, v.X)
+		v.X = newExpr
+		return gen
 	case *ast.SendStmt:
+		// v.Chan too?
+		gen, newExpr := cv.convertExpr(hc, v.Value)
+		v.Value = newExpr
+		return gen
 	case *ast.AssignStmt:
+		gen, newExprs := cv.convertExprs(hc, v.Rhs)
+		v.Rhs = newExprs
+		return gen
 	case *ast.ReturnStmt:
-
+		gen, newExprs := cv.convertExprs(hc, v.Results)
+		v.Results = newExprs
+		return gen
 	case *ast.BlockStmt:
 		cv.convertBlock(hc, v)
 
@@ -216,6 +241,10 @@ func (cv *converter) convertExprs(hc handlerChain, exprs []ast.Expr) ([]ast.Stmt
 // would likely have much less code, since I could traverse and replace nodes
 // generically. However, it would also make it harder to reason about the problem recursively.
 func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, ast.Expr) {
+	if expr == nil {
+		return nil, nil
+	}
+
 	// function literal is special case: start new conversion
 	if funcLit, ok := expr.(*ast.FuncLit); ok {
 		cv.convertFunc(funcLit.Type, funcLit.Body)
@@ -234,99 +263,77 @@ func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, as
 		v.Elts = newExprs
 		return gen, v
 	case *ast.ParenExpr:
-		if v.X == nil {
-			return nil, v
-		}
 		gen, newExpr := cv.convertExpr(hc, v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.SelectorExpr:
-		if v.X == nil {
-			return nil, v
-		}
 		gen, newExpr := cv.convertExpr(hc, v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.IndexExpr:
 		var gens []ast.Stmt
-		if v.X != nil {
-			gen, newExpr := cv.convertExpr(hc, v.X)
-			gens = append(gens, gen...)
-			v.X = newExpr
-		}
-		if v.Index != nil {
-			gen, newExpr := cv.convertExpr(hc, v.Index)
-			gens = append(gens, gen...)
-			v.Index = newExpr
-		}
+
+		gen, newExpr := cv.convertExpr(hc, v.X)
+		gens = append(gens, gen...)
+		v.X = newExpr
+
+		gen, newExpr = cv.convertExpr(hc, v.Index)
+		gens = append(gens, gen...)
+		v.Index = newExpr
+
 		return gens, v
 	case *ast.SliceExpr:
 		var gens []ast.Stmt
-		if v.Low != nil {
-			gen, newExpr := cv.convertExpr(hc, v.Low)
-			gens = append(gens, gen...)
-			v.Low = newExpr
-		}
-		if v.High != nil {
-			gen, newExpr := cv.convertExpr(hc, v.High)
-			gens = append(gens, gen...)
-			v.High = newExpr
-		}
-		if v.Max != nil {
-			gen, newExpr := cv.convertExpr(hc, v.Max)
-			gens = append(gens, gen...)
-			v.Max = newExpr
-		}
+
+		gen, newExpr := cv.convertExpr(hc, v.Low)
+		gens = append(gens, gen...)
+		v.Low = newExpr
+
+		gen, newExpr = cv.convertExpr(hc, v.High)
+		gens = append(gens, gen...)
+		v.High = newExpr
+
+		gen, newExpr = cv.convertExpr(hc, v.Max)
+		gens = append(gens, gen...)
+		v.Max = newExpr
+
 		return gens, v
 	case *ast.TypeAssertExpr:
-		if v.X == nil {
-			return nil, v
-		}
 		gen, newExpr := cv.convertExpr(hc, v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.CallExpr:
 		var gens []ast.Stmt
-		if v.Fun != nil {
-			gen, newExpr := cv.convertExpr(hc, v.Fun)
-			gens = append(gens, gen...)
-			v.Fun = newExpr
-		}
+
+		gen, newExpr := cv.convertExpr(hc, v.Fun)
+		gens = append(gens, gen...)
+		v.Fun = newExpr
+
 		gen, newExprs := cv.convertExprs(hc, v.Args)
 		gens = append(gens, gen...)
 		v.Args = newExprs
 		return gen, v
 	case *ast.StarExpr:
-		if v.X == nil {
-			return nil, v
-		}
 		gen, newExpr := cv.convertExpr(hc, v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.UnaryExpr:
-		if v.X == nil {
-			return nil, v
-		}
 		gen, newExpr := cv.convertExpr(hc, v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.BinaryExpr:
 		var gens []ast.Stmt
-		if v.X != nil {
-			gen, newExpr := cv.convertExpr(hc, v.X)
-			gens = append(gens, gen...)
-			v.X = newExpr
-		}
-		if v.Y != nil {
-			gen, newExpr := cv.convertExpr(hc, v.Y)
-			gens = append(gens, gen...)
-			v.Y = newExpr
-		}
+
+		gen, newExpr := cv.convertExpr(hc, v.X)
+		gens = append(gens, gen...)
+		v.X = newExpr
+
+		gen, newExpr = cv.convertExpr(hc, v.Y)
+		gens = append(gens, gen...)
+		v.Y = newExpr
+
 		return gens, v
 	case *ast.KeyValueExpr:
-		if v.Value == nil {
-			return nil, nil
-		}
 		gen, newExpr := cv.convertExpr(hc, v.Value)
 		v.Value = newExpr
 		return gen, v
@@ -377,7 +384,7 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 				Op: token.NEQ,
 				Y:  &ast.Ident{Name: "nil"},
 			},
-			Body: hc.eval(),
+			Body: hc.eval(varList[len(varList)-1]),
 		},
 	}
 
@@ -385,9 +392,27 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 }
 
 type handlerChain struct {
+	ft     *ast.FuncType
 	top    []ast.Stmt
 	bottom ast.Stmt
 	stack  [][]ast.Stmt
+}
+
+func newHandlerChain(ft *ast.FuncType) handlerChain {
+	var top []ast.Stmt
+	bottom := &ast.ReturnStmt{}
+	for i, field := range ft.Results.List {
+		name := handleResultPrefix + strconv.Itoa(i)
+		top = append(top, varDecl(name, field.Type))
+		bottom.Results = append(bottom.Results, &ast.Ident{
+			Name: name,
+		})
+	}
+	return handlerChain{
+		ft:     ft,
+		top:    top,
+		bottom: bottom,
+	}
 }
 
 func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
@@ -398,43 +423,57 @@ func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
 	}
 }
 
-func (hc handlerChain) eval() *ast.BlockStmt {
-	b := &ast.BlockStmt{}
-	b.List = append(b.List, hc.top...)
-	for i := len(hc.stack) - 1; i >= 0; i-- {
-		b.List = append(b.List, hc.stack[i]...)
+func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
+	if len(hc.top) == 0 && len(hc.stack) == 0 {
+		panic(errors.New("handler chain is empty (no default handler)"))
 	}
-	b.List = append(b.List, hc.bottom)
-	return b
-}
 
-// Returns the top and bottom of the handler chain for function with type FT.
-// The top var declarations are to simplify returning zero values.
-func handleTopAndBottom(ft *ast.FuncType) ([]*ast.DeclStmt, *ast.ReturnStmt) {
-	var decls []*ast.DeclStmt
-	ret := &ast.ReturnStmt{}
-	for i, field := range ft.Results.List {
-		name := handleResultPrefix + strconv.Itoa(i)
-		decls = append(decls, &ast.DeclStmt{
-			Decl: &ast.GenDecl{
-				Tok: token.VAR,
-				Specs: []ast.Spec{
-					&ast.ValueSpec{
-						Names: []*ast.Ident{
-							&ast.Ident{
-								Name: name,
-							},
+	body := &ast.BlockStmt{}
+	call := &ast.CallExpr{
+		Args: []ast.Expr{errVar},
+		Fun: &ast.FuncLit{
+			Type: &ast.FuncType{
+				Params: &ast.FieldList{
+					List: []*ast.Field{
+						&ast.Field{
+							Names: []*ast.Ident{&ast.Ident{Name: handleErr}},
+							Type:  &ast.Ident{Name: "error"},
 						},
-						Type: field.Type,
 					},
 				},
+				Results: hc.ft.Results,
 			},
-		})
-		ret.Results = append(ret.Results, &ast.Ident{
-			Name: name,
-		})
+			Body: &ast.BlockStmt{},
+		},
 	}
-	return decls, ret
+
+	body.List = append(body.List, hc.top...)
+	for i := len(hc.stack) - 1; i >= 0; i-- {
+		body.List = append(body.List, hc.stack[i]...)
+	}
+	body.List = append(body.List, hc.bottom)
+
+	if len(hc.top) == 0 {
+		return &ast.BlockStmt{
+			List: []ast.Stmt{
+				&ast.ExprStmt{
+					X: call,
+				},
+				&ast.ReturnStmt{},
+			},
+		}
+
+	}
+
+	return &ast.BlockStmt{
+		List: []ast.Stmt{
+			&ast.ReturnStmt{
+				Results: []ast.Expr{
+					call,
+				},
+			},
+		},
+	}
 }
 
 func toHandleBlock(node ast.Node) (*ast.BlockStmt, bool) {
@@ -474,4 +513,22 @@ func toCheckCall(node ast.Node) (*ast.CallExpr, bool) {
 		panic(errors.New("invalid check call: must only have one arg"))
 	}
 	return call, true
+}
+
+func varDecl(name string, typeExpr ast.Expr) *ast.DeclStmt {
+	return &ast.DeclStmt{
+		Decl: &ast.GenDecl{
+			Tok: token.VAR,
+			Specs: []ast.Spec{
+				&ast.ValueSpec{
+					Names: []*ast.Ident{
+						&ast.Ident{
+							Name: name,
+						},
+					},
+					Type: typeExpr,
+				},
+			},
+		},
+	}
 }
