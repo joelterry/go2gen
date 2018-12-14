@@ -3,15 +3,10 @@ package main
 import (
 	"errors"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"go/types"
 	"strconv"
 )
-
-func parseString(s string) (ast.Node, error) {
-	return parser.ParseFile(token.NewFileSet(), "", s, 0)
-}
 
 // exprList is needed in the case of multiple return values
 type exprList []ast.Expr
@@ -53,10 +48,17 @@ func (cm callMap) resultCount(call *ast.CallExpr) (int, error) {
 type converter struct {
 	cm      callMap
 	numVars int
+	err     error
 }
 
 // converts top-level function declarations and literals
 func (cv *converter) convertFile(f *ast.File) {
+	defer func() {
+		if r := recover(); r != nil {
+			cv.err = r.(error)
+		}
+	}()
+
 	for _, decl := range f.Decls {
 		switch v := decl.(type) {
 		case *ast.FuncDecl:
@@ -338,7 +340,7 @@ func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, as
 		v.Value = newExpr
 		return gen, v
 	default:
-		return nil, nil
+		return nil, v
 	}
 }
 
@@ -399,20 +401,29 @@ type handlerChain struct {
 }
 
 func newHandlerChain(ft *ast.FuncType) handlerChain {
-	var top []ast.Stmt
-	bottom := &ast.ReturnStmt{}
+	hc := handlerChain{
+		ft:     ft,
+		top:    []ast.Stmt{},
+		bottom: &ast.ReturnStmt{},
+	}
+
+	if ft.Results == nil {
+		return hc
+	}
+
+	var results []ast.Expr
 	for i, field := range ft.Results.List {
 		name := handleResultPrefix + strconv.Itoa(i)
-		top = append(top, varDecl(name, field.Type))
-		bottom.Results = append(bottom.Results, &ast.Ident{
+		hc.top = append(hc.top, varDecl(name, field.Type))
+		results = append(results, &ast.Ident{
 			Name: name,
 		})
 	}
-	return handlerChain{
-		ft:     ft,
-		top:    top,
-		bottom: bottom,
+	hc.bottom = &ast.ReturnStmt{
+		Results: results,
 	}
+
+	return hc
 }
 
 func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
