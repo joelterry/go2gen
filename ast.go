@@ -26,14 +26,19 @@ func (el exprList) Expr() ast.Expr {
 type callMap map[*ast.Ident]types.Object
 
 func (cm callMap) resultCount(call *ast.CallExpr) (int, error) {
-	ident, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		lit, ok := call.Fun.(*ast.FuncLit)
-		if !ok {
-			return 0, errors.New("callMap: CallExpr.Fun not Ident or FuncLit")
-		}
-		return len(lit.Type.Results.List), nil
+	var ident *ast.Ident
+
+	switch v := call.Fun.(type) {
+	case *ast.Ident:
+		ident = v
+	case *ast.SelectorExpr:
+		ident = v.Sel
+	case *ast.FuncLit:
+		return len(v.Type.Results.List), nil
+	default:
+		return 0, errors.New("callMap: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
 	}
+
 	obj, ok := cm[ident]
 	if !ok {
 		return 0, errors.New("callMap: object not found")
@@ -220,7 +225,7 @@ func (cv *converter) convertExprs(hc handlerChain, exprs []ast.Expr) ([]ast.Stmt
 			stmts, newExprList := cv.convertCheck(hc, checkCall)
 			if len(newExprList) > 1 {
 				if len(exprs) > 1 {
-					panic("error: multiple values in context where only one is allowed")
+					panic(errors.New("error: multiple values in context where only one is allowed"))
 				}
 				return stmts, newExprList
 			}
@@ -345,7 +350,8 @@ func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, as
 }
 
 func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.Stmt, exprList) {
-	// call should be confirmed as check already
+	gen, newExpr := cv.convertExpr(hc, call.Args[0])
+	call.Args[0] = newExpr
 	expr := call.Args[0]
 
 	// get the number of results passed to check
@@ -374,7 +380,7 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 		varList2[i] = &ast.Ident{Name: varName}
 	}
 
-	gen := []ast.Stmt{
+	gen = append(gen, []ast.Stmt{
 		&ast.AssignStmt{
 			Lhs: varList,
 			Tok: token.DEFINE,
@@ -388,16 +394,18 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 			},
 			Body: hc.eval(varList[len(varList)-1]),
 		},
-	}
+	}...)
 
-	return gen, exprList(varList2)
+	// leave out error
+	return gen, exprList(varList2[0 : len(varList2)-1])
 }
 
 type handlerChain struct {
-	ft     *ast.FuncType
-	top    []ast.Stmt
-	bottom ast.Stmt
-	stack  [][]ast.Stmt
+	ft         *ast.FuncType
+	top        []ast.Stmt
+	bottom     ast.Stmt
+	stack      [][]ast.Stmt
+	hasDefault bool
 }
 
 func newHandlerChain(ft *ast.FuncType) handlerChain {
@@ -411,14 +419,35 @@ func newHandlerChain(ft *ast.FuncType) handlerChain {
 		return hc
 	}
 
+	ftrl := ft.Results.List
+
+	hc.hasDefault = false
+	if len(ftrl) > 0 {
+		lit, ok := ftrl[len(ftrl)-1].Type.(*ast.Ident)
+		if ok && lit.Name == "error" {
+			hc.hasDefault = true
+		}
+	}
+
 	var results []ast.Expr
-	for i, field := range ft.Results.List {
+	zeroResults := ftrl
+	if hc.hasDefault {
+		zeroResults = zeroResults[:len(zeroResults)-1]
+	}
+	for i, field := range zeroResults {
 		name := handleResultPrefix + strconv.Itoa(i)
+		// zero-value declarations
 		hc.top = append(hc.top, varDecl(name, field.Type))
 		results = append(results, &ast.Ident{
 			Name: name,
 		})
 	}
+	if hc.hasDefault {
+		results = append(results, &ast.Ident{
+			Name: handleErr,
+		})
+	}
+
 	hc.bottom = &ast.ReturnStmt{
 		Results: results,
 	}
@@ -428,18 +457,26 @@ func newHandlerChain(ft *ast.FuncType) handlerChain {
 
 func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
 	return handlerChain{
-		top:    hc.top,
-		bottom: hc.bottom,
-		stack:  append(hc.stack, block.List),
+		ft:         hc.ft,
+		top:        hc.top,
+		bottom:     hc.bottom,
+		stack:      append(hc.stack, block.List),
+		hasDefault: hc.hasDefault,
 	}
 }
 
 func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
-	if len(hc.top) == 0 && len(hc.stack) == 0 {
+	if !hc.hasDefault && len(hc.stack) == 0 {
 		panic(errors.New("handler chain is empty (no default handler)"))
 	}
 
 	body := &ast.BlockStmt{}
+	body.List = append(body.List, hc.top...)
+	for i := len(hc.stack) - 1; i >= 0; i-- {
+		body.List = append(body.List, hc.stack[i]...)
+	}
+	body.List = append(body.List, hc.bottom)
+
 	call := &ast.CallExpr{
 		Args: []ast.Expr{errVar},
 		Fun: &ast.FuncLit{
@@ -454,17 +491,12 @@ func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
 				},
 				Results: hc.ft.Results,
 			},
-			Body: &ast.BlockStmt{},
+			Body: body,
 		},
 	}
 
-	body.List = append(body.List, hc.top...)
-	for i := len(hc.stack) - 1; i >= 0; i-- {
-		body.List = append(body.List, hc.stack[i]...)
-	}
-	body.List = append(body.List, hc.bottom)
-
-	if len(hc.top) == 0 {
+	// change something so I don't have cast
+	if len(hc.bottom.(*ast.ReturnStmt).Results) == 0 {
 		return &ast.BlockStmt{
 			List: []ast.Stmt{
 				&ast.ExprStmt{

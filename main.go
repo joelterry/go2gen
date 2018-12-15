@@ -20,7 +20,10 @@ const (
 )
 
 func main() {
-	dir := "foo"
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
 
 	fset := token.NewFileSet()
 	fm, cm, err := parseDir(dir, fset)
