@@ -26,13 +26,13 @@ func main() {
 	}
 
 	fset := token.NewFileSet()
-	fm, cm, err := parseDir(dir, fset)
+	fm, info, err := parseDir(dir, fset)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	cv := &converter{
-		cm: cm,
+		info: info,
 	}
 
 	for name, f := range fm {

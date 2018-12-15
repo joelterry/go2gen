@@ -17,7 +17,7 @@ func parseString(s string) (ast.Node, error) {
 	return parser.ParseFile(token.NewFileSet(), "", s, 0)
 }
 
-func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, callMap, error) {
+func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, *types.Info, error) {
 	pkg, err := build.ImportDir(dirPath, 0)
 	if err != nil {
 		return nil, nil, err
@@ -89,9 +89,11 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, callMa
 		Importer: importer.Default(),
 	}
 	info := &types.Info{
-		Uses: make(callMap),
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
 	}
 	cfg.Check(pkg.Name, fset, allFiles, info)
 
-	return go2Files, info.Uses, nil
+	return go2Files, info, nil
 }

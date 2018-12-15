@@ -22,36 +22,8 @@ func (el exprList) Expr() ast.Expr {
 	panic(errors.New("error: multiple values in context where only one is allowed"))
 }
 
-// callMap has type information gathered in the parsing phase via types.Info.Uses.
-type callMap map[*ast.Ident]types.Object
-
-func (cm callMap) resultCount(call *ast.CallExpr) (int, error) {
-	var ident *ast.Ident
-
-	switch v := call.Fun.(type) {
-	case *ast.Ident:
-		ident = v
-	case *ast.SelectorExpr:
-		ident = v.Sel
-	case *ast.FuncLit:
-		return len(v.Type.Results.List), nil
-	default:
-		return 0, errors.New("callMap: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
-	}
-
-	obj, ok := cm[ident]
-	if !ok {
-		return 0, errors.New("callMap: object not found")
-	}
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return 0, errors.New("callMap: object not function")
-	}
-	return sig.Results().Len(), nil
-}
-
 type converter struct {
-	cm      callMap
+	info    *types.Info
 	numVars int
 	err     error
 }
@@ -90,7 +62,7 @@ func (cv *converter) convertFile(f *ast.File) {
 }
 
 func (cv *converter) convertFunc(ft *ast.FuncType, body *ast.BlockStmt) {
-	cv.convertBlock(newHandlerChain(ft), body)
+	cv.convertBlock(newHandlerChain(ft, cv.info), body)
 }
 
 func (cv *converter) convertBlock(hc handlerChain, block *ast.BlockStmt) {
@@ -359,7 +331,7 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 	exprCall, ok := expr.(*ast.CallExpr)
 	if ok {
 		var err error
-		numResults, err = cv.cm.resultCount(exprCall)
+		numResults, err = resultCount(cv.info, exprCall)
 		if err != nil {
 			panic(err)
 		}
@@ -401,102 +373,50 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 }
 
 type handlerChain struct {
-	ft         *ast.FuncType
-	top        []ast.Stmt
-	bottom     ast.Stmt
-	stack      [][]ast.Stmt
-	hasDefault bool
+	ft    *ast.FuncType
+	stack [][]ast.Stmt
 }
 
-func newHandlerChain(ft *ast.FuncType) handlerChain {
-	hc := handlerChain{
-		ft:     ft,
-		top:    []ast.Stmt{},
-		bottom: &ast.ReturnStmt{},
-	}
+func newHandlerChain(ft *ast.FuncType, info *types.Info) handlerChain {
+	return handlerChain{
+		ft: &ast.FuncType{
+			Params: &ast.FieldList{
+				List: []*ast.Field{
+					&ast.Field{
+						Names: []*ast.Ident{&ast.Ident{Name: handleErr}},
+						Type:  &ast.Ident{Name: "error"},
+					},
+				},
+			},
+			Results: ft.Results,
+		},
 
-	if ft.Results == nil {
-		return hc
+		stack: [][]ast.Stmt{
+			[]ast.Stmt{defaultHandleStmt(ft, info)},
+		},
 	}
-
-	ftrl := ft.Results.List
-
-	hc.hasDefault = false
-	if len(ftrl) > 0 {
-		lit, ok := ftrl[len(ftrl)-1].Type.(*ast.Ident)
-		if ok && lit.Name == "error" {
-			hc.hasDefault = true
-		}
-	}
-
-	var results []ast.Expr
-	zeroResults := ftrl
-	if hc.hasDefault {
-		zeroResults = zeroResults[:len(zeroResults)-1]
-	}
-	for i, field := range zeroResults {
-		name := handleResultPrefix + strconv.Itoa(i)
-		// zero-value declarations
-		hc.top = append(hc.top, varDecl(name, field.Type))
-		results = append(results, &ast.Ident{
-			Name: name,
-		})
-	}
-	if hc.hasDefault {
-		results = append(results, &ast.Ident{
-			Name: handleErr,
-		})
-	}
-
-	hc.bottom = &ast.ReturnStmt{
-		Results: results,
-	}
-
-	return hc
 }
 
 func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
-	return handlerChain{
-		ft:         hc.ft,
-		top:        hc.top,
-		bottom:     hc.bottom,
-		stack:      append(hc.stack, block.List),
-		hasDefault: hc.hasDefault,
-	}
+	hc.stack = append(hc.stack, block.List)
+	return hc
 }
 
 func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
-	if !hc.hasDefault && len(hc.stack) == 0 {
-		panic(errors.New("handler chain is empty (no default handler)"))
-	}
-
 	body := &ast.BlockStmt{}
-	body.List = append(body.List, hc.top...)
 	for i := len(hc.stack) - 1; i >= 0; i-- {
 		body.List = append(body.List, hc.stack[i]...)
 	}
-	body.List = append(body.List, hc.bottom)
 
 	call := &ast.CallExpr{
 		Args: []ast.Expr{errVar},
 		Fun: &ast.FuncLit{
-			Type: &ast.FuncType{
-				Params: &ast.FieldList{
-					List: []*ast.Field{
-						&ast.Field{
-							Names: []*ast.Ident{&ast.Ident{Name: handleErr}},
-							Type:  &ast.Ident{Name: "error"},
-						},
-					},
-				},
-				Results: hc.ft.Results,
-			},
+			Type: hc.ft,
 			Body: body,
 		},
 	}
 
-	// change something so I don't have cast
-	if len(hc.bottom.(*ast.ReturnStmt).Results) == 0 {
+	if hc.ft.Results == nil || len(hc.ft.Results.List) == 0 {
 		return &ast.BlockStmt{
 			List: []ast.Stmt{
 				&ast.ExprStmt{
@@ -505,7 +425,6 @@ func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
 				&ast.ReturnStmt{},
 			},
 		}
-
 	}
 
 	return &ast.BlockStmt{
@@ -516,6 +435,39 @@ func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
 				},
 			},
 		},
+	}
+}
+
+func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
+	var ftrl []*ast.Field
+	if ft.Results != nil {
+		ftrl = ft.Results.List
+	}
+	if len(ftrl) == 0 {
+		return panicWithErrStmt(handleErr)
+	}
+
+	last := ftrl[len(ftrl)-1]
+	lastIdent, ok := last.Type.(*ast.Ident)
+	if !ok || lastIdent.Name != "error" {
+		return panicWithErrStmt(handleErr)
+	}
+
+	resultList := make([]ast.Expr, len(ft.Results.List))
+	for i, field := range ft.Results.List {
+		if i < len(resultList)-1 {
+			resultList[i] = &ast.Ident{
+				Name: zeroValueString(field.Type, info),
+			}
+		} else {
+			resultList[i] = &ast.Ident{
+				Name: handleErr,
+			}
+		}
+	}
+
+	return &ast.ReturnStmt{
+		Results: resultList,
 	}
 }
 
@@ -573,5 +525,61 @@ func varDecl(name string, typeExpr ast.Expr) *ast.DeclStmt {
 				},
 			},
 		},
+	}
+}
+
+func panicWithErrStmt(errVar string) *ast.ExprStmt {
+	return &ast.ExprStmt{
+		X: &ast.CallExpr{
+			Fun: &ast.Ident{Name: "panic"},
+			Args: []ast.Expr{
+				&ast.Ident{Name: errVar},
+			},
+		},
+	}
+}
+
+func resultCount(info *types.Info, call *ast.CallExpr) (int, error) {
+	var ident *ast.Ident
+
+	switch v := call.Fun.(type) {
+	case *ast.Ident:
+		ident = v
+	case *ast.SelectorExpr:
+		ident = v.Sel
+	case *ast.FuncLit:
+		return len(v.Type.Results.List), nil
+	default:
+		return 0, errors.New("callMap: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
+	}
+
+	obj, ok := info.Uses[ident]
+	if !ok {
+		return 0, errors.New("callMap: object not found")
+	}
+	sig, ok := obj.Type().(*types.Signature)
+	if !ok {
+		return 0, errors.New("callMap: object not function")
+	}
+	return sig.Results().Len(), nil
+}
+
+func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
+	t := info.TypeOf(typeExpr)
+	switch v := t.Underlying().(type) {
+	case *types.Basic:
+		switch v.Info() {
+		case types.IsBoolean:
+			return "false"
+		case types.IsString:
+			return `""`
+		default:
+			return "0"
+		}
+	case *types.Struct:
+		// I think typeExpr should always be an Ident if the underlying type is struct
+		return typeExpr.(*ast.Ident).Name + "{}"
+	default:
+		return "nil"
 	}
 }
