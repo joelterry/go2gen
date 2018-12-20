@@ -6,6 +6,8 @@ import (
 	"go/token"
 	"go/types"
 	"strconv"
+
+	"github.com/go-toolsmith/astcopy"
 )
 
 // exprList is needed in the case of multiple return values
@@ -403,39 +405,20 @@ func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
 }
 
 func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
-	body := &ast.BlockStmt{}
+	block := &ast.BlockStmt{}
 	for i := len(hc.stack) - 1; i >= 0; i-- {
-		body.List = append(body.List, hc.stack[i]...)
+		block.List = append(block.List, hc.stack[i]...)
 	}
 
-	call := &ast.CallExpr{
-		Args: []ast.Expr{errVar},
-		Fun: &ast.FuncLit{
-			Type: hc.ft,
-			Body: body,
-		},
+	errIdent, ok := errVar.(*ast.Ident)
+	if !ok {
+		panic("expression passed to handle should be an identifier")
 	}
 
-	if hc.ft.Results == nil || len(hc.ft.Results.List) == 0 {
-		return &ast.BlockStmt{
-			List: []ast.Stmt{
-				&ast.ExprStmt{
-					X: call,
-				},
-				&ast.ReturnStmt{},
-			},
-		}
-	}
+	blockCopy := astcopy.BlockStmt(block)
+	replaceIdent(blockCopy, handleErr, errIdent.Name)
+	return blockCopy
 
-	return &ast.BlockStmt{
-		List: []ast.Stmt{
-			&ast.ReturnStmt{
-				Results: []ast.Expr{
-					call,
-				},
-			},
-		},
-	}
 }
 
 func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
@@ -508,6 +491,15 @@ func toCheckCall(node ast.Node) (*ast.CallExpr, bool) {
 		panic(errors.New("invalid check call: must only have one arg"))
 	}
 	return call, true
+}
+
+func replaceIdent(root ast.Node, old string, new string) {
+	ast.Inspect(root, func(node ast.Node) bool {
+		if ident, ok := node.(*ast.Ident); ok && ident.Name == old {
+			ident.Name = new
+		}
+		return true
+	})
 }
 
 func varDecl(name string, typeExpr ast.Expr) *ast.DeclStmt {
