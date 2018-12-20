@@ -417,6 +417,7 @@ func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
 
 	blockCopy := astcopy.BlockStmt(block)
 	replaceIdent(blockCopy, handleErr, errIdent.Name)
+	trimTerminatingStatements(blockCopy)
 	return blockCopy
 
 }
@@ -573,5 +574,43 @@ func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
 		return typeExpr.(*ast.Ident).Name + "{}"
 	default:
 		return "nil"
+	}
+}
+
+// https://golang.org/ref/spec#Terminating_statements
+// 5-8 (for, switch, select, labels) are currently not implemented.
+//
+// returns true if stmt is terminating
+func trimTerminatingStatements(stmt ast.Stmt) bool {
+	if stmt == nil {
+		return false
+	}
+	switch v := stmt.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.ExprStmt:
+		callExpr, ok := v.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		ident, ok := callExpr.Fun.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		return ident.Name == "panic"
+	case *ast.BlockStmt:
+		for i, child := range v.List {
+			if trimTerminatingStatements(child) {
+				v.List = v.List[0 : i+1]
+				return true
+			}
+		}
+		return false
+	case *ast.IfStmt:
+		ifTerm := trimTerminatingStatements(v.Body)
+		elseTerm := trimTerminatingStatements(v.Else)
+		return ifTerm && elseTerm
+	default:
+		return false
 	}
 }
