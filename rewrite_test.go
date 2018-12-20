@@ -21,11 +21,13 @@ func TestRewriteValid(t *testing.T) {
 		"check nil",
 		"check add(1, 2)",
 		"check add(check add(1, 1), check add(1, 1))",
+		"handle err { print(err) \n\t os.Exit(1) \n }",
 	}
 	outputs := []string{
-		"_go2check ( nil ) ; ",
-		"_go2check ( add ( 1 , 2 ) ) ; ",
-		"_go2check ( add ( _go2check ( add ( 1 , 1 ) ) , _go2check ( add ( 1 , 1 ) ) ) ) ; ",
+		"_go2check(nil)",
+		"_go2check(add(1, 2))",
+		"_go2check(add(_go2check(add(1, 1)), _go2check(add(1, 1))))",
+		"if _go2handle { print(_go2handleErr) \n\t os.Exit(1) \n }",
 	}
 
 	for i, input := range inputs {

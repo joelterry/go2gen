@@ -14,21 +14,7 @@ import (
 // check <expr> => _go2check(<expr>)
 // handle <err> { <body> } => if _go2handle { <body (all instances of <err> replaced with _go2handleErr) > }
 func RewriteChecksAndHandles(src string) (string, error) {
-
-	// https://golang.org/pkg/go/scanner/#Scanner.Scan
-	var sc scanner.Scanner
-	fset := token.NewFileSet()
-	file := fset.AddFile("", fset.Base(), len(src))
-	sc.Init(file, []byte(src), nil, 0)
-
-	var sb strings.Builder
-
-	rw := &rewriter{
-		sc: &sc,
-		sb: &sb,
-	}
-
-	return rw.rewrite()
+	return newRewriter(src).rewrite()
 }
 
 // https://golang.org/src/go/parser/parser.go#L502
@@ -68,12 +54,40 @@ func (dc *delimCounter) count(tok token.Token) {
 	}
 }
 
+type stringChange struct {
+	value string
+	start int
+	end   int
+}
+
 type rewriter struct {
-	sc      *scanner.Scanner
-	sb      *strings.Builder
-	err     error
-	nextTok token.Token
-	nextLit string
+	src  string
+	fset *token.FileSet
+	sc   *scanner.Scanner
+
+	err error
+
+	index int
+	tok   token.Token
+	lit   string
+
+	changes []stringChange
+
+	rewind bool
+}
+
+func newRewriter(src string) *rewriter {
+	// https://golang.org/pkg/go/scanner/#Scanner.Scan
+	var sc scanner.Scanner
+	fset := token.NewFileSet()
+	file := fset.AddFile("", fset.Base(), len(src))
+	sc.Init(file, []byte(src), nil, 0)
+
+	return &rewriter{
+		src:  src,
+		fset: fset,
+		sc:   &sc,
+	}
 }
 
 func (rw *rewriter) rewrite() (string, error) {
@@ -81,28 +95,35 @@ func (rw *rewriter) rewrite() (string, error) {
 	if rw.err != nil {
 		return "", rw.err
 	}
-	return rw.sb.String(), nil
+
+	var sb strings.Builder
+
+	si := 0
+	for _, change := range rw.changes {
+		_, err := sb.WriteString(rw.src[si:change.start])
+		if err != nil {
+			return "", err
+		}
+		_, err = sb.WriteString(change.value)
+		if err != nil {
+			return "", err
+		}
+		si = change.end
+	}
+	sb.WriteString(rw.src[si:])
+
+	return sb.String(), nil
 }
 
-func (rw *rewriter) scan() (token.Token, string) {
-	if rw.nextTok != token.ILLEGAL {
-		tok, lit := rw.nextTok, rw.nextLit
-		rw.nextTok = token.ILLEGAL
-		rw.nextLit = ""
-		return tok, lit
+func (rw *rewriter) scan() (int, token.Token, string) {
+	if rw.rewind {
+		rw.rewind = false
+		return rw.index, rw.tok, rw.lit
 	}
-	_, tok, lit := rw.sc.Scan()
-	return tok, lit
-}
-
-func (rw *rewriter) write(tok token.Token, lit string) {
-	switch {
-	case tok.IsOperator() || tok.IsKeyword():
-		rw.sb.WriteString(tok.String())
-	default:
-		rw.sb.WriteString(lit)
-	}
-	rw.sb.WriteString(" ")
+	pos, tok, lit := rw.sc.Scan()
+	rw.index = rw.fset.Position(pos).Offset
+	rw.tok, rw.lit = tok, lit
+	return rw.index, rw.tok, rw.lit
 }
 
 func (rw *rewriter) stateInit() {
@@ -112,7 +133,7 @@ func (rw *rewriter) stateInit() {
 		}
 	}()
 	for {
-		tok, lit := rw.scan()
+		_, tok, lit := rw.scan()
 		if tok == token.EOF {
 			break
 		}
@@ -127,18 +148,20 @@ func (rw *rewriter) stateInit() {
 			continue
 		}
 
-		rw.write(tok, lit)
 	}
 }
 
 func (rw *rewriter) stateCheck() {
-	rw.write(token.IDENT, checkFunc)
-	rw.write(token.LPAREN, "(")
+	rw.changes = append(rw.changes, stringChange{
+		value: checkFunc + "(",
+		start: rw.index,
+		end:   rw.index + len("check "),
+	})
 
 	dc := delimCounter{}
 
 	for {
-		tok, lit := rw.scan()
+		_, tok, lit := rw.scan()
 		if tok == token.EOF {
 			panic(errors.New("EOF in the middle of check"))
 		}
@@ -149,9 +172,15 @@ func (rw *rewriter) stateCheck() {
 		}
 
 		if dc.isZero() && exprEnd[tok] {
-			rw.write(token.RPAREN, ")")
-			rw.nextTok = tok
-			rw.nextLit = lit
+			rw.rewind = true
+
+			// start same as end since ")" is an insert
+			rw.changes = append(rw.changes, stringChange{
+				value: ")",
+				start: rw.index,
+				end:   rw.index,
+			})
+
 			break
 		}
 
@@ -161,32 +190,35 @@ func (rw *rewriter) stateCheck() {
 			panic(errors.New("mismatched delimiters"))
 		}
 
-		rw.write(tok, lit)
 	}
 }
 
 func (rw *rewriter) stateHandle() {
-	tok, lit := rw.scan()
+	handleI := rw.index
+
+	_, tok, lit := rw.scan()
 	if tok != token.IDENT {
 		panic(errors.New("expected identifier after handle"))
 	}
 
 	errName := lit
 
-	tok, _ = rw.scan()
+	rw.changes = append(rw.changes, stringChange{
+		value: "if " + handleBool,
+		start: handleI,
+		end:   rw.index + len(errName),
+	})
+
+	_, tok, _ = rw.scan()
 	if tok != token.LBRACE {
 		panic(errors.New("expected left brace after 'handle IDENT'"))
 	}
-
-	rw.write(token.IF, "if")
-	rw.write(token.IDENT, handleBool)
-	rw.write(token.LBRACE, "{")
 
 	dc := delimCounter{}
 	dc.count(token.LBRACE)
 
 	for {
-		tok, lit := rw.scan()
+		_, tok, lit := rw.scan()
 		if tok == token.EOF {
 			panic(errors.New("EOF in the middle of handle"))
 		}
@@ -199,7 +231,11 @@ func (rw *rewriter) stateHandle() {
 		}
 
 		if lit == errName {
-			rw.write(token.IDENT, handleErr)
+			rw.changes = append(rw.changes, stringChange{
+				value: handleErr,
+				start: rw.index,
+				end:   rw.index + len(errName),
+			})
 			continue
 		}
 
@@ -208,8 +244,6 @@ func (rw *rewriter) stateHandle() {
 		if dc.isNegative() {
 			panic(errors.New("mismatched delimiters"))
 		}
-
-		rw.write(tok, lit)
 
 		if dc.isZero() && tok.IsOperator() {
 			break
