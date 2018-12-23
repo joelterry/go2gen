@@ -580,7 +580,10 @@ func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
 			}
 			return pkg.Name + "." + selector.Sel.Name + "{}"
 		}
-		panic("struct type's corresponding ast expr should only be Ident or SelectorExpr")
+		if _, ok := typeExpr.(*ast.StructType); ok {
+			return v.String() + "{}"
+		}
+		panic(errors.New("struct type's corresponding ast expr should only be Ident or SelectorExpr"))
 	default:
 		return "nil"
 	}
