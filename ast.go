@@ -419,7 +419,6 @@ func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
 	replaceIdent(blockCopy, handleErr, errIdent.Name)
 	trimTerminatingStatements(blockCopy)
 	return blockCopy
-
 }
 
 func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
@@ -432,6 +431,7 @@ func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
 	}
 
 	last := ftrl[len(ftrl)-1]
+
 	lastIdent, ok := last.Type.(*ast.Ident)
 	if !ok || lastIdent.Name != "error" {
 		return panicWithErrStmt(handleErr)
@@ -570,8 +570,17 @@ func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
 			return "0"
 		}
 	case *types.Struct:
-		// I think typeExpr should always be an Ident if the underlying type is struct
-		return typeExpr.(*ast.Ident).Name + "{}"
+		if ident, ok := typeExpr.(*ast.Ident); ok {
+			return ident.Name + "{}"
+		}
+		if selector, ok := typeExpr.(*ast.SelectorExpr); ok {
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok {
+				panic("struct type ast.SelectorExpr.X should be Ident (package name)")
+			}
+			return pkg.Name + "." + selector.Sel.Name + "{}"
+		}
+		panic("struct type's corresponding ast expr should only be Ident or SelectorExpr")
 	default:
 		return "nil"
 	}
