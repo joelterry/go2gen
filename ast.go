@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"go/ast"
+	"go/printer"
 	"go/token"
 	"go/types"
 	"strconv"
@@ -24,24 +26,71 @@ func (el exprList) Expr() ast.Expr {
 	panic(errors.New("error: multiple values in context where only one is allowed"))
 }
 
-type converter struct {
-	info    *types.Info
-	numVars int
-	err     error
+type astContext struct {
+	fset       *token.FileSet
+	info       *types.Info
+	handleFunc *ast.FuncType
+	stack      [][]ast.Stmt
+	varTypes   map[string]int
+}
+
+func (ac astContext) withFunction(ft *ast.FuncType) astContext {
+	ac.handleFunc = &ast.FuncType{
+		Params: &ast.FieldList{
+			List: []*ast.Field{
+				&ast.Field{
+					Names: []*ast.Ident{&ast.Ident{Name: handleErr}},
+					Type:  &ast.Ident{Name: "error"},
+				},
+			},
+		},
+		Results: ft.Results,
+	}
+	ac.stack = [][]ast.Stmt{
+		[]ast.Stmt{defaultHandleStmt(ft, ac.info)},
+	}
+	return ac
+}
+
+func (ac astContext) withHandler(block *ast.BlockStmt) astContext {
+	ac.stack = append(ac.stack, block.List)
+	return ac
+}
+
+func (ac astContext) withScope() astContext {
+	ac.varTypes = make(map[string]int)
+	return ac
+}
+
+func (ac astContext) evalHandleChain(errVar ast.Expr) *ast.BlockStmt {
+	block := &ast.BlockStmt{}
+	for i := len(ac.stack) - 1; i >= 0; i-- {
+		block.List = append(block.List, ac.stack[i]...)
+	}
+
+	errIdent, ok := errVar.(*ast.Ident)
+	if !ok {
+		panic("expression passed to handle should be an identifier")
+	}
+
+	blockCopy := astcopy.BlockStmt(block)
+	replaceIdent(blockCopy, handleErr, errIdent.Name)
+	trimTerminatingStatements(blockCopy)
+	return blockCopy
 }
 
 // converts top-level function declarations and literals
-func (cv *converter) convertFile(f *ast.File) {
+func (ac astContext) convertFile(f *ast.File) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			cv.err = r.(error)
+			err = r.(error)
 		}
 	}()
 
 	for _, decl := range f.Decls {
 		switch v := decl.(type) {
 		case *ast.FuncDecl:
-			cv.convertFunc(v.Type, v.Body)
+			ac.convertFunc(v.Type, v.Body)
 		case *ast.GenDecl:
 			if v.Tok != token.VAR {
 				continue
@@ -56,26 +105,30 @@ func (cv *converter) convertFile(f *ast.File) {
 					if !ok {
 						continue
 					}
-					cv.convertFunc(funcLit.Type, funcLit.Body)
+					ac.convertFunc(funcLit.Type, funcLit.Body)
 				}
 			}
 		}
 	}
+
+	return
 }
 
-func (cv *converter) convertFunc(ft *ast.FuncType, body *ast.BlockStmt) {
-	cv.convertBlock(newHandlerChain(ft, cv.info), body)
+func (ac astContext) convertFunc(ft *ast.FuncType, body *ast.BlockStmt) {
+	ac = ac.withFunction(ft)
+	ac.convertBlock(body)
 }
 
-func (cv *converter) convertBlock(hc handlerChain, block *ast.BlockStmt) {
+func (ac astContext) convertBlock(block *ast.BlockStmt) {
+	ac = ac.withScope()
 	var newList []ast.Stmt
 	for _, stmt := range block.List {
 		handleBlock, ok := toHandleBlock(stmt)
 		if ok {
-			hc = hc.extend(handleBlock)
+			ac = ac.withHandler(handleBlock)
 			continue
 		}
-		generated := cv.convertStmt(hc, stmt)
+		generated := ac.convertStmt(stmt)
 		newList = append(newList, generated...)
 		newList = append(newList, stmt)
 	}
@@ -117,7 +170,7 @@ func (cv *converter) convertBlock(hc handlerChain, block *ast.BlockStmt) {
 // -- maybe:
 // LabeledStmt (probably not, don't understand it well enough)
 // IncDecStmt (I thikn it would require changing to assignment)
-func (cv *converter) convertStmt(hc handlerChain, stmt ast.Stmt) []ast.Stmt {
+func (ac astContext) convertStmt(stmt ast.Stmt) []ast.Stmt {
 	switch v := stmt.(type) {
 	// TODO: fill these out
 	case *ast.DeclStmt:
@@ -132,7 +185,7 @@ func (cv *converter) convertStmt(hc handlerChain, stmt ast.Stmt) []ast.Stmt {
 				if !ok {
 					continue
 				}
-				gen, newExprs := cv.convertExprs(hc, valueSpec.Values)
+				gen, newExprs := ac.convertExprs(valueSpec.Values)
 				valueSpec.Values = newExprs
 				return gen
 			}
@@ -140,46 +193,46 @@ func (cv *converter) convertStmt(hc handlerChain, stmt ast.Stmt) []ast.Stmt {
 			return nil
 		}
 	case *ast.ExprStmt:
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		v.X = newExpr
 		return gen
 	case *ast.SendStmt:
 		// v.Chan too?
-		gen, newExpr := cv.convertExpr(hc, v.Value)
+		gen, newExpr := ac.convertExpr(v.Value)
 		v.Value = newExpr
 		return gen
 	case *ast.AssignStmt:
-		gen, newExprs := cv.convertExprs(hc, v.Rhs)
+		gen, newExprs := ac.convertExprs(v.Rhs)
 		v.Rhs = newExprs
 		return gen
 	case *ast.ReturnStmt:
-		gen, newExprs := cv.convertExprs(hc, v.Results)
+		gen, newExprs := ac.convertExprs(v.Results)
 		v.Results = newExprs
 		return gen
 	case *ast.BlockStmt:
-		cv.convertBlock(hc, v)
+		ac.convertBlock(v)
 
 	case *ast.IfStmt:
-		cv.convertBlock(hc, v.Body)
-		cv.convertStmt(hc, v.Else)
+		ac.convertBlock(v.Body)
+		ac.convertStmt(v.Else)
 	case *ast.CaseClause:
 		for _, s := range v.Body {
-			cv.convertStmt(hc, s)
+			ac.convertStmt(s)
 		}
 	case *ast.SwitchStmt:
-		cv.convertBlock(hc, v.Body)
+		ac.convertBlock(v.Body)
 	case *ast.TypeSwitchStmt:
-		cv.convertBlock(hc, v.Body)
+		ac.convertBlock(v.Body)
 	case *ast.CommClause:
 		for _, s := range v.Body {
-			cv.convertStmt(hc, s)
+			ac.convertStmt(s)
 		}
 	case *ast.SelectStmt:
-		cv.convertBlock(hc, v.Body)
+		ac.convertBlock(v.Body)
 	case *ast.ForStmt:
-		cv.convertBlock(hc, v.Body)
+		ac.convertBlock(v.Body)
 	case *ast.RangeStmt:
-		cv.convertBlock(hc, v.Body)
+		ac.convertBlock(v.Body)
 	default:
 		return nil
 	}
@@ -190,13 +243,13 @@ func (cv *converter) convertStmt(hc handlerChain, stmt ast.Stmt) []ast.Stmt {
 //
 // this is the only place where an exprList returned from convertCheck
 // isn't automatically "cast" to an Expr
-func (cv *converter) convertExprs(hc handlerChain, exprs []ast.Expr) ([]ast.Stmt, []ast.Expr) {
+func (ac astContext) convertExprs(exprs []ast.Expr) ([]ast.Stmt, []ast.Expr) {
 	var generated []ast.Stmt
 	var newExprs []ast.Expr
 
 	for _, expr := range exprs {
 		if checkCall, ok := toCheckCall(expr); ok {
-			stmts, newExprList := cv.convertCheck(hc, checkCall)
+			stmts, newExprList := ac.convertCheck(checkCall)
 			if len(newExprList) > 1 {
 				if len(exprs) > 1 {
 					panic(errors.New("error: multiple values in context where only one is allowed"))
@@ -207,7 +260,7 @@ func (cv *converter) convertExprs(hc handlerChain, exprs []ast.Expr) ([]ast.Stmt
 			newExprs = append(newExprs, newExprList...)
 			continue
 		}
-		stmts, newExpr := cv.convertExpr(hc, expr)
+		stmts, newExpr := ac.convertExpr(expr)
 		generated = append(generated, stmts...)
 		newExprs = append(newExprs, newExpr)
 	}
@@ -221,44 +274,44 @@ func (cv *converter) convertExprs(hc handlerChain, exprs []ast.Expr) ([]ast.Stmt
 // An astutil traversal (https://godoc.org/golang.org/x/tools/go/ast/astutil#Apply)
 // would likely have much less code, since I could traverse and replace nodes
 // generically. However, it would also make it harder to reason about the problem recursively.
-func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, ast.Expr) {
+func (ac astContext) convertExpr(expr ast.Expr) ([]ast.Stmt, ast.Expr) {
 	if expr == nil {
 		return nil, nil
 	}
 
 	// function literal is special case: start new conversion
 	if funcLit, ok := expr.(*ast.FuncLit); ok {
-		cv.convertFunc(funcLit.Type, funcLit.Body)
+		ac.convertFunc(funcLit.Type, funcLit.Body)
 		return nil, expr
 	}
 
 	if checkCall, ok := toCheckCall(expr); ok {
-		gen, newExprList := cv.convertCheck(hc, checkCall)
+		gen, newExprList := ac.convertCheck(checkCall)
 		return gen, newExprList.Expr()
 	}
 
 	// https://golang.org/src/go/ast/ast.go#L227
 	switch v := expr.(type) {
 	case *ast.CompositeLit:
-		gen, newExprs := cv.convertExprs(hc, v.Elts)
+		gen, newExprs := ac.convertExprs(v.Elts)
 		v.Elts = newExprs
 		return gen, v
 	case *ast.ParenExpr:
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.SelectorExpr:
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.IndexExpr:
 		var gens []ast.Stmt
 
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		gens = append(gens, gen...)
 		v.X = newExpr
 
-		gen, newExpr = cv.convertExpr(hc, v.Index)
+		gen, newExpr = ac.convertExpr(v.Index)
 		gens = append(gens, gen...)
 		v.Index = newExpr
 
@@ -266,56 +319,56 @@ func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, as
 	case *ast.SliceExpr:
 		var gens []ast.Stmt
 
-		gen, newExpr := cv.convertExpr(hc, v.Low)
+		gen, newExpr := ac.convertExpr(v.Low)
 		gens = append(gens, gen...)
 		v.Low = newExpr
 
-		gen, newExpr = cv.convertExpr(hc, v.High)
+		gen, newExpr = ac.convertExpr(v.High)
 		gens = append(gens, gen...)
 		v.High = newExpr
 
-		gen, newExpr = cv.convertExpr(hc, v.Max)
+		gen, newExpr = ac.convertExpr(v.Max)
 		gens = append(gens, gen...)
 		v.Max = newExpr
 
 		return gens, v
 	case *ast.TypeAssertExpr:
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.CallExpr:
 		var gens []ast.Stmt
 
-		gen, newExpr := cv.convertExpr(hc, v.Fun)
+		gen, newExpr := ac.convertExpr(v.Fun)
 		gens = append(gens, gen...)
 		v.Fun = newExpr
 
-		gen, newExprs := cv.convertExprs(hc, v.Args)
+		gen, newExprs := ac.convertExprs(v.Args)
 		gens = append(gens, gen...)
 		v.Args = newExprs
 		return gen, v
 	case *ast.StarExpr:
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.UnaryExpr:
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		v.X = newExpr
 		return gen, v
 	case *ast.BinaryExpr:
 		var gens []ast.Stmt
 
-		gen, newExpr := cv.convertExpr(hc, v.X)
+		gen, newExpr := ac.convertExpr(v.X)
 		gens = append(gens, gen...)
 		v.X = newExpr
 
-		gen, newExpr = cv.convertExpr(hc, v.Y)
+		gen, newExpr = ac.convertExpr(v.Y)
 		gens = append(gens, gen...)
 		v.Y = newExpr
 
 		return gens, v
 	case *ast.KeyValueExpr:
-		gen, newExpr := cv.convertExpr(hc, v.Value)
+		gen, newExpr := ac.convertExpr(v.Value)
 		v.Value = newExpr
 		return gen, v
 	default:
@@ -323,33 +376,34 @@ func (cv *converter) convertExpr(hc handlerChain, expr ast.Expr) ([]ast.Stmt, as
 	}
 }
 
-func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.Stmt, exprList) {
-	gen, newExpr := cv.convertExpr(hc, call.Args[0])
+func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
+	gen, newExpr := ac.convertExpr(call.Args[0])
 	call.Args[0] = newExpr
 	expr := call.Args[0]
 
-	// get the number of results passed to check
-	numResults := 1
+	var resultTypes []string
 	exprCall, ok := expr.(*ast.CallExpr)
 	if ok {
 		var err error
-		numResults, err = resultCount(cv.info, exprCall)
+		resultTypes, err = resultTypeNames(ac.fset, ac.info, exprCall)
 		if err != nil {
 			panic(err)
 		}
-	}
-	if numResults == 0 {
-		panic(errors.New("check on func with no return values"))
+		if len(resultTypes) == 0 {
+			panic(errors.New("check on func with no return values"))
+		}
+	} else {
+		resultTypes = []string{"error"}
 	}
 
 	// not sure if I need separate nodes to keep AST valid...
-	varList := make([]ast.Expr, numResults)  // for generated code
-	varList2 := make([]ast.Expr, numResults) // for returned exprList
+	varList := make([]ast.Expr, len(resultTypes))  // for generated code
+	varList2 := make([]ast.Expr, len(resultTypes)) // for returned exprList
 
-	for i := 0; i < numResults; i++ {
-		varName := varPrefix + strconv.Itoa(cv.numVars)
-		cv.numVars++
-
+	for i, rt := range resultTypes {
+		curr := ac.varTypes[rt]
+		ac.varTypes[rt]++
+		varName := varPrefix + rt + strconv.Itoa(curr)
 		varList[i] = &ast.Ident{Name: varName}
 		varList2[i] = &ast.Ident{Name: varName}
 	}
@@ -366,59 +420,12 @@ func (cv *converter) convertCheck(hc handlerChain, call *ast.CallExpr) ([]ast.St
 				Op: token.NEQ,
 				Y:  &ast.Ident{Name: "nil"},
 			},
-			Body: hc.eval(varList[len(varList)-1]),
+			Body: ac.evalHandleChain(varList[len(varList)-1]),
 		},
 	}...)
 
 	// leave out error
 	return gen, exprList(varList2[0 : len(varList2)-1])
-}
-
-type handlerChain struct {
-	ft    *ast.FuncType
-	stack [][]ast.Stmt
-}
-
-func newHandlerChain(ft *ast.FuncType, info *types.Info) handlerChain {
-	return handlerChain{
-		ft: &ast.FuncType{
-			Params: &ast.FieldList{
-				List: []*ast.Field{
-					&ast.Field{
-						Names: []*ast.Ident{&ast.Ident{Name: handleErr}},
-						Type:  &ast.Ident{Name: "error"},
-					},
-				},
-			},
-			Results: ft.Results,
-		},
-
-		stack: [][]ast.Stmt{
-			[]ast.Stmt{defaultHandleStmt(ft, info)},
-		},
-	}
-}
-
-func (hc handlerChain) extend(block *ast.BlockStmt) handlerChain {
-	hc.stack = append(hc.stack, block.List)
-	return hc
-}
-
-func (hc handlerChain) eval(errVar ast.Expr) *ast.BlockStmt {
-	block := &ast.BlockStmt{}
-	for i := len(hc.stack) - 1; i >= 0; i-- {
-		block.List = append(block.List, hc.stack[i]...)
-	}
-
-	errIdent, ok := errVar.(*ast.Ident)
-	if !ok {
-		panic("expression passed to handle should be an identifier")
-	}
-
-	blockCopy := astcopy.BlockStmt(block)
-	replaceIdent(blockCopy, handleErr, errIdent.Name)
-	trimTerminatingStatements(blockCopy)
-	return blockCopy
 }
 
 func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
@@ -532,6 +539,46 @@ func panicWithErrStmt(errVar string) *ast.ExprStmt {
 	}
 }
 
+func resultTypeNames(fset *token.FileSet, info *types.Info, call *ast.CallExpr) ([]string, error) {
+	var ident *ast.Ident
+
+	switch v := call.Fun.(type) {
+	case *ast.FuncLit:
+		names := make([]string, len(v.Type.Results.List))
+		for i, field := range v.Type.Results.List {
+			s, err := nodeString(fset, field.Type)
+			if err != nil {
+				return nil, err
+			}
+			names[i] = s
+		}
+		return names, nil
+	case *ast.Ident:
+		ident = v
+	case *ast.SelectorExpr:
+		ident = v.Sel
+	default:
+		return nil, errors.New("error: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
+	}
+
+	obj, ok := info.Uses[ident]
+	if !ok {
+		return nil, errors.New("error: object not found")
+	}
+	sig, ok := obj.Type().(*types.Signature)
+	if !ok {
+		return nil, errors.New("error: object not a function")
+	}
+
+	l := sig.Results().Len()
+	names := make([]string, l)
+	for i := 0; i < l; i++ {
+		//s, err := nodeString(fset, sig.Results().At(i))
+		names[i] = sig.Results().At(i).Type().String() // sig.Results().At(i)
+	}
+	return names, nil
+}
+
 func resultCount(info *types.Info, call *ast.CallExpr) (int, error) {
 	var ident *ast.Ident
 
@@ -625,4 +672,16 @@ func trimTerminatingStatements(stmt ast.Stmt) bool {
 	default:
 		return false
 	}
+}
+
+func nodeString(fset *token.FileSet, node ast.Node) (string, error) {
+	cfg := &printer.Config{
+		Mode: printer.RawFormat,
+	}
+	var buf bytes.Buffer
+	err := cfg.Fprint(&buf, fset, node)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }

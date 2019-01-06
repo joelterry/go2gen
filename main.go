@@ -13,7 +13,7 @@ const (
 	handleBool         = "_go2handle"
 	handleErr          = "_go2handleErr"
 	valuePrefix        = "_go2val"
-	varPrefix          = "_go2var"
+	varPrefix          = "_go2_"
 	errorPrefix        = "_go2err"
 	handleResultPrefix = "_go2r"
 	extension          = ".go2"
@@ -31,15 +31,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	cv := &converter{
+	ac := astContext{
+		fset: fset,
 		info: info,
 	}
 
 	for name, f := range fm {
-		cv.convertFile(f)
+		err := ac.convertFile(f)
 
-		if cv.err != nil {
-			log.Fatal("convert err: ", cv.err)
+		if err != nil {
+			log.Fatal("convert err: ", err)
 		}
 		w, err := os.Create(path.Join(dir, name) + ".go")
 		if err != nil {
