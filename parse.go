@@ -75,7 +75,7 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, *types
 		if err != nil {
 			return nil, nil, err
 		}
-		f, err := parser.ParseFile(fset, "", src, 0)
+		f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
 		if err != nil {
 			return nil, nil, err
 		}

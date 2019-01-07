@@ -1,15 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"errors"
-	"go/ast"
-	"go/printer"
 	"go/token"
 	"go/types"
 	"strconv"
 
-	"github.com/go-toolsmith/astcopy"
+	ast "github.com/dave/dst"
+	"github.com/dave/dst/decorator"
 )
 
 // exprList is needed in the case of multiple return values
@@ -26,28 +24,21 @@ func (el exprList) Expr() ast.Expr {
 	panic(errors.New("error: multiple values in context where only one is allowed"))
 }
 
+type astInfo struct {
+	fset *token.FileSet
+	info *types.Info
+	dec  *decorator.Decorator
+}
+
 type astContext struct {
-	fset       *token.FileSet
-	info       *types.Info
-	handleFunc *ast.FuncType
-	stack      [][]ast.Stmt
-	varTypes   map[string]int
+	astInfo
+	stack    [][]ast.Stmt
+	varTypes map[string]int
 }
 
 func (ac astContext) withFunction(ft *ast.FuncType) astContext {
-	ac.handleFunc = &ast.FuncType{
-		Params: &ast.FieldList{
-			List: []*ast.Field{
-				&ast.Field{
-					Names: []*ast.Ident{&ast.Ident{Name: handleErr}},
-					Type:  &ast.Ident{Name: "error"},
-				},
-			},
-		},
-		Results: ft.Results,
-	}
 	ac.stack = [][]ast.Stmt{
-		[]ast.Stmt{defaultHandleStmt(ft, ac.info)},
+		[]ast.Stmt{defaultHandleStmt(ft, ac.astInfo)},
 	}
 	return ac
 }
@@ -62,19 +53,14 @@ func (ac astContext) withScope() astContext {
 	return ac
 }
 
-func (ac astContext) evalHandleChain(errVar ast.Expr) *ast.BlockStmt {
+func (ac astContext) evalHandleChain(errName string) *ast.BlockStmt {
 	block := &ast.BlockStmt{}
 	for i := len(ac.stack) - 1; i >= 0; i-- {
 		block.List = append(block.List, ac.stack[i]...)
 	}
 
-	errIdent, ok := errVar.(*ast.Ident)
-	if !ok {
-		panic("expression passed to handle should be an identifier")
-	}
-
-	blockCopy := astcopy.BlockStmt(block)
-	replaceIdent(blockCopy, handleErr, errIdent.Name)
+	blockCopy := copyBlockDst(block)
+	replaceIdent(blockCopy, handleErr, errName)
 	trimTerminatingStatements(blockCopy)
 	return blockCopy
 }
@@ -385,7 +371,7 @@ func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
 	exprCall, ok := expr.(*ast.CallExpr)
 	if ok {
 		var err error
-		resultTypes, err = resultTypeNames(ac.fset, ac.info, exprCall)
+		resultTypes, err = resultTypeNames(ac.astInfo, exprCall)
 		if err != nil {
 			panic(err)
 		}
@@ -396,16 +382,24 @@ func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
 		resultTypes = []string{"error"}
 	}
 
-	// not sure if I need separate nodes to keep AST valid...
-	varList := make([]ast.Expr, len(resultTypes))  // for generated code
-	varList2 := make([]ast.Expr, len(resultTypes)) // for returned exprList
+	if resultTypes[len(resultTypes)-1] != "error" {
+		panic(errors.New("last type of check expression must be error"))
+	}
 
+	varNames := make([]string, len(resultTypes))
 	for i, rt := range resultTypes {
 		curr := ac.varTypes[rt]
 		ac.varTypes[rt]++
-		varName := varPrefix + rt + strconv.Itoa(curr)
-		varList[i] = &ast.Ident{Name: varName}
-		varList2[i] = &ast.Ident{Name: varName}
+		varNames[i] = varPrefix + rt + strconv.Itoa(curr)
+	}
+
+	// need separate nodes to keep AST valid, especially if using github.com/dave/dst
+	varErr := &ast.Ident{Name: varNames[len(varNames)-1]}
+	varList := make([]ast.Expr, len(varNames))  // for generated code
+	varList2 := make([]ast.Expr, len(varNames)) // for returned exprList
+	for i, vn := range varNames {
+		varList[i] = &ast.Ident{Name: vn}
+		varList2[i] = &ast.Ident{Name: vn}
 	}
 
 	gen = append(gen, []ast.Stmt{
@@ -416,11 +410,11 @@ func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
 		},
 		&ast.IfStmt{
 			Cond: &ast.BinaryExpr{
-				X:  varList[len(varList)-1],
+				X:  varErr,
 				Op: token.NEQ,
 				Y:  &ast.Ident{Name: "nil"},
 			},
-			Body: ac.evalHandleChain(varList[len(varList)-1]),
+			Body: ac.evalHandleChain(varNames[len(varList)-1]),
 		},
 	}...)
 
@@ -428,7 +422,7 @@ func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
 	return gen, exprList(varList2[0 : len(varList2)-1])
 }
 
-func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
+func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 	var ftrl []*ast.Field
 	if ft.Results != nil {
 		ftrl = ft.Results.List
@@ -448,7 +442,7 @@ func defaultHandleStmt(ft *ast.FuncType, info *types.Info) ast.Stmt {
 	for i, field := range ft.Results.List {
 		if i < len(resultList)-1 {
 			resultList[i] = &ast.Ident{
-				Name: zeroValueString(field.Type, info),
+				Name: zeroValueString(ai, field.Type),
 			}
 		} else {
 			resultList[i] = &ast.Ident{
@@ -539,14 +533,14 @@ func panicWithErrStmt(errVar string) *ast.ExprStmt {
 	}
 }
 
-func resultTypeNames(fset *token.FileSet, info *types.Info, call *ast.CallExpr) ([]string, error) {
+func resultTypeNames(ai astInfo, call *ast.CallExpr) ([]string, error) {
 	var ident *ast.Ident
 
 	switch v := call.Fun.(type) {
 	case *ast.FuncLit:
 		names := make([]string, len(v.Type.Results.List))
 		for i, field := range v.Type.Results.List {
-			s, err := nodeString(fset, field.Type)
+			s, err := ai.nodeStringDst(field.Type)
 			if err != nil {
 				return nil, err
 			}
@@ -561,7 +555,7 @@ func resultTypeNames(fset *token.FileSet, info *types.Info, call *ast.CallExpr) 
 		return nil, errors.New("error: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
 	}
 
-	obj, ok := info.Uses[ident]
+	obj, ok := ai.infoUsesDst(ident)
 	if !ok {
 		return nil, errors.New("error: object not found")
 	}
@@ -573,39 +567,13 @@ func resultTypeNames(fset *token.FileSet, info *types.Info, call *ast.CallExpr) 
 	l := sig.Results().Len()
 	names := make([]string, l)
 	for i := 0; i < l; i++ {
-		//s, err := nodeString(fset, sig.Results().At(i))
-		names[i] = sig.Results().At(i).Type().String() // sig.Results().At(i)
+		names[i] = sig.Results().At(i).Type().String()
 	}
 	return names, nil
 }
 
-func resultCount(info *types.Info, call *ast.CallExpr) (int, error) {
-	var ident *ast.Ident
-
-	switch v := call.Fun.(type) {
-	case *ast.Ident:
-		ident = v
-	case *ast.SelectorExpr:
-		ident = v.Sel
-	case *ast.FuncLit:
-		return len(v.Type.Results.List), nil
-	default:
-		return 0, errors.New("callMap: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
-	}
-
-	obj, ok := info.Uses[ident]
-	if !ok {
-		return 0, errors.New("callMap: object not found")
-	}
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return 0, errors.New("callMap: object not function")
-	}
-	return sig.Results().Len(), nil
-}
-
-func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
-	t := info.TypeOf(typeExpr)
+func zeroValueString(ai astInfo, typeExpr ast.Expr) string {
+	t := ai.infoTypeOfDst(typeExpr)
 	switch v := t.Underlying().(type) {
 	case *types.Basic:
 		switch v.Info() {
@@ -672,16 +640,4 @@ func trimTerminatingStatements(stmt ast.Stmt) bool {
 	default:
 		return false
 	}
-}
-
-func nodeString(fset *token.FileSet, node ast.Node) (string, error) {
-	cfg := &printer.Config{
-		Mode: printer.RawFormat,
-	}
-	var buf bytes.Buffer
-	err := cfg.Fprint(&buf, fset, node)
-	if err != nil {
-		return "", err
-	}
-	return buf.String(), nil
 }
