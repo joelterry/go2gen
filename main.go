@@ -19,15 +19,27 @@ const (
 )
 
 func main() {
-	dir, err := os.Getwd()
-	if err != nil {
-		panic(err)
+	var dir string
+	var err error
+	if len(os.Args) > 1 {
+		dir = os.Args[1]
+	} else {
+		dir, err = os.Getwd()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
+	err = generate(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
 
+func generate(dir string) error {
 	fset := token.NewFileSet()
 	fm, info, err := parseDir(dir, fset)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	dec := decorator.NewDecorator(fset)
@@ -43,25 +55,27 @@ func main() {
 	for name, f := range fm {
 		df, err := dec.DecorateFile(f)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		err = ac.convertFile(df)
 
 		if err != nil {
-			log.Fatal("convert err: ", err)
+			return err
 		}
 		w, err := os.Create(path.Join(dir, name) + ".go")
 		if err != nil {
-			log.Fatal("file err: ", err)
+			return err
 		}
 		_, err = w.WriteString(generatedComment + "\n\n")
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		err = ai.writeFileDst(w, df)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
+
+	return nil
 }

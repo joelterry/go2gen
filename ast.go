@@ -65,7 +65,6 @@ func (ac astContext) evalHandleChain(errName string) *ast.BlockStmt {
 	return blockCopy
 }
 
-// converts top-level function declarations and literals
 func (ac astContext) convertFile(f *ast.File) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -158,7 +157,6 @@ func (ac astContext) convertBlock(block *ast.BlockStmt) {
 // IncDecStmt (I thikn it would require changing to assignment)
 func (ac astContext) convertStmt(stmt ast.Stmt) []ast.Stmt {
 	switch v := stmt.(type) {
-	// TODO: fill these out
 	case *ast.DeclStmt:
 		genDecl, ok := v.Decl.(*ast.GenDecl)
 		if !ok {
