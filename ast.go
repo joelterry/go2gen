@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"strconv"
+	"strings"
 
 	ast "github.com/dave/dst"
 	"github.com/dave/dst/decorator"
@@ -36,19 +37,21 @@ type astContext struct {
 	checkMap
 	handleMap
 	filePos  token.Pos
-	stack    [][]ast.Stmt
+	stack    []*ast.BlockStmt
 	varTypes map[string]int
 }
 
 func (ac astContext) withFunction(ft *ast.FuncType) astContext {
-	ac.stack = [][]ast.Stmt{
-		[]ast.Stmt{defaultHandleStmt(ft, ac.astInfo)},
+	ac.stack = []*ast.BlockStmt{
+		&ast.BlockStmt{
+			List: []ast.Stmt{defaultHandleStmt(ft, ac.astInfo)},
+		},
 	}
 	return ac
 }
 
 func (ac astContext) withHandler(block *ast.BlockStmt) astContext {
-	ac.stack = append(ac.stack, block.List)
+	ac.stack = append(ac.stack, block)
 	return ac
 }
 
@@ -58,15 +61,22 @@ func (ac astContext) withScope() astContext {
 }
 
 func (ac astContext) evalHandleChain(errName string) *ast.BlockStmt {
-	block := &ast.BlockStmt{}
+	chain := &ast.BlockStmt{}
 	for i := len(ac.stack) - 1; i >= 0; i-- {
-		block.List = append(block.List, ac.stack[i]...)
+		var hErr string
+		if i == 0 {
+			// default handler
+			hErr = "err"
+		} else {
+			pos := ac.nodePosDst(ac.stack[i]) - ac.filePos + 1
+			hErr = ac.handleMap[pos]
+		}
+		handleCopy := copyBlockDst(ac.stack[i])
+		replaceIdent(handleCopy, hErr, errName)
+		chain.List = append(chain.List, handleCopy.List...)
 	}
-
-	blockCopy := copyBlockDst(block)
-	replaceIdent(blockCopy, handleErr, errName)
-	trimTerminatingStatements(blockCopy)
-	return blockCopy
+	trimTerminatingStatements(chain)
+	return chain
 }
 
 func (ac astContext) convertFile(f *ast.File, cm checkMap, hm handleMap) (err error) {
@@ -426,7 +436,6 @@ func (ac astContext) convertCheck(check ast.Expr) ([]ast.Stmt, exprList) {
 		},
 	}...)
 
-	fmt.Println("WHAT")
 	// leave out error
 	return gen, exprList(varList2[0 : len(varList2)-1])
 }
@@ -469,14 +478,14 @@ func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 		ftrl = ft.Results.List
 	}
 	if len(ftrl) == 0 {
-		return panicWithErrStmt(handleErr)
+		return panicWithErrStmt("err")
 	}
 
 	last := ftrl[len(ftrl)-1]
 
 	lastIdent, ok := last.Type.(*ast.Ident)
 	if !ok || lastIdent.Name != "error" {
-		return panicWithErrStmt(handleErr)
+		return panicWithErrStmt("err")
 	}
 
 	resultList := make([]ast.Expr, len(ft.Results.List))
@@ -487,7 +496,7 @@ func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 			}
 		} else {
 			resultList[i] = &ast.Ident{
-				Name: handleErr,
+				Name: "err",
 			}
 		}
 	}
@@ -546,20 +555,21 @@ func resultTypeNames(ai astInfo, call *ast.CallExpr) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			names[i] = s
+			names[i] = sanitizeType(s)
 		}
 		return names, nil
+	case *ast.SelectorExpr:
+		// TODO: LEFT OFF HERE, NEED TO ADD infoSelections* to dst.go
+		ident = v.Sel
 	case *ast.Ident:
 		ident = v
-	case *ast.SelectorExpr:
-		ident = v.Sel
 	default:
 		return nil, errors.New("error: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
 	}
 
 	obj, ok := ai.infoUsesDst(ident)
 	if !ok {
-		return nil, errors.New("error: object not found")
+		return nil, fmt.Errorf("error: object not found: %s", ident.Name)
 	}
 	sig, ok := obj.Type().(*types.Signature)
 	if !ok {
@@ -569,7 +579,7 @@ func resultTypeNames(ai astInfo, call *ast.CallExpr) ([]string, error) {
 	l := sig.Results().Len()
 	names := make([]string, l)
 	for i := 0; i < l; i++ {
-		names[i] = sig.Results().At(i).Type().String()
+		names[i] = sanitizeType(sig.Results().At(i).Type().String())
 	}
 	return names, nil
 }
@@ -642,4 +652,30 @@ func trimTerminatingStatements(stmt ast.Stmt) bool {
 	default:
 		return false
 	}
+}
+
+// replaces *, [], and [N] from type name
+func sanitizeType(s string) string {
+	s = strings.Replace(s, ".", "", -1)
+	s = strings.Replace(s, "*", "pointer", -1)
+	var result string
+	for {
+		l := strings.Index(s, "[")
+		if l < 0 {
+			break
+		}
+		r := strings.Index(s, "]")
+		if r < 0 {
+			panic("sanitizeType: mismatched delimiters")
+		}
+
+		result += s[:l]
+		if r > l+1 {
+			result += "array"
+		} else {
+			result += "slice"
+		}
+		s = s[r+1:]
+	}
+	return result + s
 }
