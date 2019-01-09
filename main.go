@@ -19,6 +19,11 @@ const (
 )
 
 func main() {
+	/*
+		ProcessFile("foo/foo.go2", "foo/foo.go3")
+		return
+	*/
+
 	var dir string
 	var err error
 	if len(os.Args) > 1 {
@@ -52,18 +57,18 @@ func generate(dir string) error {
 		astInfo: ai,
 	}
 
-	for name, f := range fm {
-		df, err := dec.DecorateFile(f)
+	for _, pf := range fm {
+		df, err := dec.DecorateFile(pf.File)
 		if err != nil {
 			return err
 		}
 
-		err = ac.convertFile(df)
+		err = ac.convertFile(df, pf.checkMap, pf.handleMap)
 
 		if err != nil {
 			return err
 		}
-		w, err := os.Create(path.Join(dir, name) + ".go")
+		w, err := os.Create(path.Join(dir, pf.name) + ".go")
 		if err != nil {
 			return err
 		}

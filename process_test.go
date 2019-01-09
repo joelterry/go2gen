@@ -44,6 +44,16 @@ func TestProcess(t *testing.T) {
 			handleMap: handleMap{},
 		},
 		ptc{
+			in:  "x := check add(check add(1, 1), check add(1, 1))",
+			out: "x := add(add(1, 1), add(1, 1))",
+			checkMap: checkMap{
+				6:  true,
+				10: true,
+				21: true,
+			},
+			handleMap: handleMap{},
+		},
+		ptc{
 			in:       "handle errFoo { print(errFoo) \n\t os.Exit(1) \n }",
 			out:      "{ print(errFoo) \n\t os.Exit(1) \n }",
 			checkMap: checkMap{},

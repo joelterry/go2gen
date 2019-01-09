@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"go/scanner"
 	"go/token"
+	"io/ioutil"
+	"os"
 	"strings"
 )
 
@@ -77,4 +80,24 @@ func process(src string) (string, checkMap, handleMap, error) {
 	}
 
 	return sb.String(), cm, hm, nil
+}
+
+// for debugging
+func ProcessFile(input string, output string) {
+	b, err := ioutil.ReadFile(input)
+	if err != nil {
+		panic(err)
+	}
+	s, cm, hm, err := process(string(b))
+	if err != nil {
+		panic(err)
+	}
+	err = ioutil.WriteFile(output, []byte(s), 0666)
+	if err != nil {
+		panic(err)
+	}
+	_, err = os.Stdout.Write([]byte(fmt.Sprintf("callMap: \n%#v\n\nhandleMap:\n%#v\n\n", cm, hm)))
+	if err != nil {
+		panic(err)
+	}
 }

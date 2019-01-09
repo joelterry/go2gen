@@ -13,11 +13,18 @@ import (
 	"path"
 )
 
+type processedFile struct {
+	*ast.File
+	checkMap
+	handleMap
+	name string
+}
+
 func parseString(s string) (ast.Node, error) {
 	return parser.ParseFile(token.NewFileSet(), "", s, 0)
 }
 
-func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, *types.Info, error) {
+func parseDir(dirPath string, fset *token.FileSet) ([]processedFile, *types.Info, error) {
 	pkg, err := build.ImportDir(dirPath, 0)
 	if err != nil {
 		return nil, nil, err
@@ -42,7 +49,7 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, *types
 	}
 
 	var allFiles []*ast.File
-	go2Files := make(map[string]*ast.File)
+	var go2Files []processedFile
 
 	for _, file := range files {
 
@@ -71,16 +78,24 @@ func parseDir(dirPath string, fset *token.FileSet) (map[string]*ast.File, *types
 		if err != nil {
 			return nil, nil, err
 		}
-		src, err := RewriteChecksAndHandles(string(b))
+
+		src, cm, hm, err := process(string(b))
 		if err != nil {
 			return nil, nil, err
 		}
+
 		f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
 		if err != nil {
 			return nil, nil, err
 		}
+
 		allFiles = append(allFiles, f)
-		go2Files[name] = f
+		go2Files = append(go2Files, processedFile{
+			File:      f,
+			checkMap:  cm,
+			handleMap: hm,
+			name:      name,
+		})
 	}
 
 	// https://github.com/golang/example/tree/master/gotypes#identifier-resolution

@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/format"
 	"go/printer"
+	"go/token"
 	"go/types"
 	"io"
 
@@ -77,4 +78,12 @@ func (ai astInfo) writeFileAst(w io.Writer, f *ast.File) error {
 
 func (ai astInfo) writeFileDst(w io.Writer, f *dst.File) error {
 	return decorator.Fprint(w, f)
+}
+
+func (ai astInfo) nodePosAst(node ast.Node) token.Pos {
+	return node.Pos()
+}
+
+func (ai astInfo) nodePosDst(node dst.Node) token.Pos {
+	return ai.dec.Ast.Nodes[node].Pos()
 }

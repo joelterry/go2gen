@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"go/token"
 	"go/types"
 	"strconv"
@@ -32,6 +33,9 @@ type astInfo struct {
 
 type astContext struct {
 	astInfo
+	checkMap
+	handleMap
+	filePos  token.Pos
 	stack    [][]ast.Stmt
 	varTypes map[string]int
 }
@@ -65,12 +69,16 @@ func (ac astContext) evalHandleChain(errName string) *ast.BlockStmt {
 	return blockCopy
 }
 
-func (ac astContext) convertFile(f *ast.File) (err error) {
+func (ac astContext) convertFile(f *ast.File, cm checkMap, hm handleMap) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = r.(error)
 		}
 	}()
+
+	ac.checkMap = cm
+	ac.handleMap = hm
+	ac.filePos = ac.nodePosDst(f)
 
 	for _, decl := range f.Decls {
 		switch v := decl.(type) {
@@ -108,7 +116,7 @@ func (ac astContext) convertBlock(block *ast.BlockStmt) {
 	ac = ac.withScope()
 	var newList []ast.Stmt
 	for _, stmt := range block.List {
-		handleBlock, ok := toHandleBlock(stmt)
+		handleBlock, ok := ac.toHandleBlock(stmt)
 		if ok {
 			ac = ac.withHandler(handleBlock)
 			continue
@@ -232,8 +240,8 @@ func (ac astContext) convertExprs(exprs []ast.Expr) ([]ast.Stmt, []ast.Expr) {
 	var newExprs []ast.Expr
 
 	for _, expr := range exprs {
-		if checkCall, ok := toCheckCall(expr); ok {
-			stmts, newExprList := ac.convertCheck(checkCall)
+		if ac.isCheckExpr(expr) {
+			stmts, newExprList := ac.convertCheck(expr)
 			if len(newExprList) > 1 {
 				if len(exprs) > 1 {
 					panic(errors.New("error: multiple values in context where only one is allowed"))
@@ -269,8 +277,8 @@ func (ac astContext) convertExpr(expr ast.Expr) ([]ast.Stmt, ast.Expr) {
 		return nil, expr
 	}
 
-	if checkCall, ok := toCheckCall(expr); ok {
-		gen, newExprList := ac.convertCheck(checkCall)
+	if ac.isCheckExpr(expr) {
+		gen, newExprList := ac.convertCheck(expr)
 		return gen, newExprList.Expr()
 	}
 
@@ -360,10 +368,12 @@ func (ac astContext) convertExpr(expr ast.Expr) ([]ast.Stmt, ast.Expr) {
 	}
 }
 
-func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
-	gen, newExpr := ac.convertExpr(call.Args[0])
-	call.Args[0] = newExpr
-	expr := call.Args[0]
+func (ac astContext) convertCheck(check ast.Expr) ([]ast.Stmt, exprList) {
+	//fmt.Printf("%#v\n", check)
+
+	pos := ac.nodePosDst(check) - ac.filePos + 1
+	delete(ac.checkMap, pos)
+	gen, expr := ac.convertExpr(check)
 
 	var resultTypes []string
 	exprCall, ok := expr.(*ast.CallExpr)
@@ -416,8 +426,41 @@ func (ac astContext) convertCheck(call *ast.CallExpr) ([]ast.Stmt, exprList) {
 		},
 	}...)
 
+	fmt.Println("WHAT")
 	// leave out error
 	return gen, exprList(varList2[0 : len(varList2)-1])
+}
+
+func (ac astContext) toHandleBlock(stmt ast.Stmt) (*ast.BlockStmt, bool) {
+	if stmt == nil {
+		return nil, false
+	}
+	pos := ac.nodePosDst(stmt) - ac.filePos + 1
+	if _, ok := ac.handleMap[pos]; ok {
+		return stmt.(*ast.BlockStmt), true
+	}
+	return nil, false
+}
+
+func (ac astContext) isCheckExpr(expr ast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	pos := ac.nodePosDst(expr) - ac.filePos + 1
+	str, err := ac.nodeStringDst(expr)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%d: %#v\n", pos, str)
+	if !ac.checkMap[pos] {
+		return false
+	}
+	//fmt.Printf("%#v\n", ac.checkMap)
+	switch expr.(type) {
+	case *ast.BinaryExpr, *ast.KeyValueExpr:
+		return false
+	}
+	return true
 }
 
 func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
@@ -452,45 +495,6 @@ func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 	return &ast.ReturnStmt{
 		Results: resultList,
 	}
-}
-
-func toHandleBlock(node ast.Node) (*ast.BlockStmt, bool) {
-	if node == nil {
-		return nil, false
-	}
-	ifstmt, ok := node.(*ast.IfStmt)
-	if !ok {
-		return nil, false
-	}
-	ident, ok := ifstmt.Cond.(*ast.Ident)
-	if !ok {
-		return nil, false
-	}
-	if ident.Name != handleBool {
-		return nil, false
-	}
-	return ifstmt.Body, true
-}
-
-func toCheckCall(node ast.Node) (*ast.CallExpr, bool) {
-	if node == nil {
-		return nil, false
-	}
-	call, ok := node.(*ast.CallExpr)
-	if !ok {
-		return nil, false
-	}
-	ident, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		return nil, false
-	}
-	if ident.Name != checkFunc {
-		return nil, false
-	}
-	if len(call.Args) != 1 {
-		panic(errors.New("invalid check call: must only have one arg"))
-	}
-	return call, true
 }
 
 func replaceIdent(root ast.Node, old string, new string) {
