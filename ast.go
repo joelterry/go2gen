@@ -1,478 +1,471 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/format"
 	"go/token"
 	"go/types"
 	"strconv"
 	"strings"
 
-	ast "github.com/dave/dst"
-	"github.com/dave/dst/decorator"
+	"github.com/go-toolsmith/astcopy"
+	"golang.org/x/tools/go/ast/astutil"
 )
 
-// exprList is needed in the case of multiple return values
-type exprList []ast.Expr
-
-func (el exprList) Expr() ast.Expr {
-	// does this case make sense?
-	if len(el) == 0 {
-		return nil
-	}
-	if len(el) == 1 {
-		return el[0]
-	}
-	panic(errors.New("error: multiple values in context where only one is allowed"))
-}
-
-type astInfo struct {
+type go2File struct {
+	name string
 	fset *token.FileSet
-	info *types.Info
-	dec  *decorator.Decorator
-}
-
-type astContext struct {
-	astInfo
+	f    *ast.File
 	checkMap
 	handleMap
-	filePos  token.Pos
-	stack    []*ast.BlockStmt
-	varTypes map[string]int
+
+	original *ast.File
 }
 
-func (ac astContext) withFunction(ft *ast.FuncType) astContext {
-	ac.stack = []*ast.BlockStmt{
-		&ast.BlockStmt{
-			List: []ast.Stmt{defaultHandleStmt(ft, ac.astInfo)},
-		},
+func (gf go2File) pos(node ast.Node) token.Pos {
+	return node.Pos() - gf.f.Pos() + 1
+}
+
+func (gf go2File) string() (string, error) {
+	var buf bytes.Buffer
+	err := format.Node(&buf, gf.fset, gf.f)
+	if err != nil {
+		return "", err
 	}
-	return ac
-}
-
-func (ac astContext) withHandler(block *ast.BlockStmt) astContext {
-	ac.stack = append(ac.stack, block)
-	return ac
-}
-
-func (ac astContext) withScope() astContext {
-	ac.varTypes = make(map[string]int)
-	return ac
-}
-
-func (ac astContext) evalHandleChain(errName string) *ast.BlockStmt {
-	chain := &ast.BlockStmt{}
-	for i := len(ac.stack) - 1; i >= 0; i-- {
-		var hErr string
-		if i == 0 {
-			// default handler
-			hErr = "err"
-		} else {
-			pos := ac.nodePosDst(ac.stack[i]) - ac.filePos + 1
-			hErr = ac.handleMap[pos]
-		}
-		handleCopy := copyBlockDst(ac.stack[i])
-		replaceIdent(handleCopy, hErr, errName)
-		chain.List = append(chain.List, handleCopy.List...)
+	str := buf.String()
+	f, err := parseString(str)
+	if err != nil {
+		return "", err
 	}
-	trimTerminatingStatements(chain)
-	return chain
-}
 
-func (ac astContext) convertFile(f *ast.File, cm checkMap, hm handleMap) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = r.(error)
+	funcPositions := make(map[token.Pos]token.Pos) // beginning -> end
+	astutil.Apply(f, func(c *astutil.Cursor) bool {
+		node := c.Node()
+		if node == nil {
+			return true
 		}
-	}()
+		if isFunc(node) {
+			funcPositions[node.Pos()] = node.End()
+		}
+		return true
+	}, nil)
 
-	ac.checkMap = cm
-	ac.handleMap = hm
-	ac.filePos = ac.nodePosDst(f)
-
-	for _, decl := range f.Decls {
-		switch v := decl.(type) {
-		case *ast.FuncDecl:
-			ac.convertFunc(v.Type, v.Body)
-		case *ast.GenDecl:
-			if v.Tok != token.VAR {
+	var cs cuts
+	for start, end := range funcPositions {
+		s, e := int(start-1), int(end-1)
+		var trailing []int
+		newlineFound := false
+		for i := s; i < e; i++ {
+			if str[i] != '\n' {
+				newlineFound = false
+				if len(trailing) > 0 {
+					cs = append(cs, cut{
+						start: trailing[0],
+						end:   trailing[len(trailing)-1] + 1,
+					})
+					trailing = nil
+				}
 				continue
 			}
-			for _, spec := range v.Specs {
-				valueSpec, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				for _, value := range valueSpec.Values {
-					funcLit, ok := value.(*ast.FuncLit)
-					if !ok {
-						continue
-					}
-					ac.convertFunc(funcLit.Type, funcLit.Body)
-				}
+			if newlineFound {
+				trailing = append(trailing, i)
+				continue
 			}
+			newlineFound = true
 		}
 	}
 
-	return
+	return cs.Apply(str)
 }
 
-func (ac astContext) convertFunc(ft *ast.FuncType, body *ast.BlockStmt) {
-	ac = ac.withFunction(ft)
-	ac.convertBlock(body)
+type global struct {
+	ft     funcTree
+	bt     blockTree
+	scopes scopeMap
+
+	hcs            handleChains
+	handleErrNames map[*ast.BlockStmt]string
+	snh            stmtNumHandlers
+	ces            map[ast.Expr]checkLocation
+
+	delExprStmts map[*ast.ExprStmt]bool
 }
 
-func (ac astContext) convertBlock(block *ast.BlockStmt) {
-	ac = ac.withScope()
-	var newList []ast.Stmt
-	for _, stmt := range block.List {
-		handleBlock, ok := ac.toHandleBlock(stmt)
+type funcTree map[ast.Node]ast.Node // node => func
+type blockTree map[ast.Node]*ast.BlockStmt
+type handleChains map[ast.Node][]*ast.BlockStmt // func => []block
+type stmtNumHandlers map[ast.Stmt]int
+type checkExprs map[checkLocation][]ast.Expr
+type checkLocation struct {
+	fun   ast.Node
+	block *ast.BlockStmt
+	stmt  ast.Stmt
+}
+type scopeMap map[*ast.BlockStmt]map[string]int
+
+type context struct {
+	*go2File
+	global
+}
+
+func (ctx context) buildTrees() {
+	astutil.Apply(ctx.f, func(c *astutil.Cursor) bool {
+		node := c.Node()
+		if node == nil {
+			return true
+		}
+		if isFunc(node) {
+			ctx.ft[node] = node
+			ctx.bt[node] = ctx.bt[c.Parent()]
+			return true
+		}
+		if block, ok := node.(*ast.BlockStmt); ok {
+			ctx.ft[node] = ctx.ft[c.Parent()]
+			ctx.bt[node] = block
+			ctx.scopes[block] = make(map[string]int)
+			return true
+		}
+		ctx.ft[node] = ctx.ft[c.Parent()]
+		ctx.bt[node] = ctx.bt[c.Parent()]
+		return true
+	}, nil)
+}
+
+func (ctx context) collectHandlersAndChecks() {
+
+	// nested stmts aren't possible, so pre-built tree not necesssary
+	var currStmt ast.Stmt
+
+	checkCollected := make(map[token.Pos]bool)
+
+	astutil.Apply(ctx.f, func(c *astutil.Cursor) bool {
+		node := c.Node()
+		if node == nil {
+			return true
+		}
+
+		pos := ctx.pos(node)
+		currFunc := ctx.ft[node]
+		currBlock := ctx.bt[node]
+		if currFunc == nil || currBlock == nil {
+			return true
+		}
+
+		if errName, ok := ctx.handleMap[pos]; ok {
+			block, ok := node.(*ast.BlockStmt)
+			if !ok {
+				panic(errors.New("a block must follow handle keyword and error identifier"))
+			}
+			ctx.hcs[currFunc] = append(ctx.hcs[currFunc], block)
+			ctx.handleErrNames[block] = errName
+			c.Delete()
+			return false
+		}
+
+		stmt, ok := node.(ast.Stmt)
 		if ok {
-			ac = ac.withHandler(handleBlock)
-			continue
+			ctx.snh[stmt] = len(ctx.hcs[currFunc]) // does not include default handler
+			currStmt = stmt
+			return true
 		}
-		generated := ac.convertStmt(stmt)
-		newList = append(newList, generated...)
-		newList = append(newList, stmt)
-	}
-	block.List = newList
+
+		if ctx.checkMap[pos] {
+			if currStmt == nil {
+				panic("check expression found outside stmt... shoudln't be possible")
+			}
+
+			expr, ok := node.(ast.Expr)
+			if !ok {
+				// should this be an error?
+				return true
+			}
+			// filter out non-unary expressions
+			switch expr.(type) {
+			case *ast.BinaryExpr, *ast.KeyValueExpr:
+				return true
+			}
+
+			// ensure we don't get duplicates for the same pos
+			// for example: check fn(), we only want fn(), not the identifier fn as well
+			if checkCollected[pos] {
+				return true
+			}
+			checkCollected[pos] = true
+
+			loc := checkLocation{
+				fun:   currFunc,
+				block: currBlock,
+				stmt:  currStmt,
+			}
+
+			ctx.ces[expr] = loc
+
+			return true
+		}
+
+		return true
+	}, nil)
 }
 
-// Unlike the above convert* funcs, convertStmt and convertExprs
-// return []ast.Stmt. This is the generated code, and is passed
-// to convertBlock, since that's where the insertion will take place.
+func (ctx context) consumeTypedChecks(info *types.Info) int {
 
-// Collection of statements found here:
-// https://golang.org/src/go/ast/ast.go#L547
-//
-// -- supported statements:
-// DeclStmt
-// ExprStmt
-// SendStmt
-// AssignStmt
-// ReturnStmt
-// BlockStmt
-//
-// -- partially supported statements (only blocks):
-// IfStmt (init/cond for "if" COULD be supported, but not "if else")
-// CaseClause
-// SwitchStmt
-// TypeSwitchStmt
-// CommClause
-// SelectStmt
-// ForStmt
-// RangeStmt
-//
-// -- unsupported statements:
-// BadStmt
-// EmptyStmt
-// GoStmt (can't evaluate to a function call)
-// DeferStmt (https://go.googlesource.com/proposal/+/master/design/go2draft-error-handling.md#checking-error-returns-from-deferred-calls)
-// BranchStmt
-//
-// -- maybe:
-// LabeledStmt (probably not, don't understand it well enough)
-// IncDecStmt (I thikn it would require changing to assignment)
-func (ac astContext) convertStmt(stmt ast.Stmt) []ast.Stmt {
-	switch v := stmt.(type) {
-	case *ast.DeclStmt:
-		genDecl, ok := v.Decl.(*ast.GenDecl)
+	interruptedStmts := make(map[ast.Stmt]bool)
+
+	postorder := func(c *astutil.Cursor) bool {
+		node := c.Node()
+
+		expr, ok := node.(ast.Expr)
 		if !ok {
-			return nil
+			return true
 		}
-		switch genDecl.Tok {
-		case token.VAR, token.CONST:
-			for _, spec := range genDecl.Specs {
-				valueSpec, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				gen, newExprs := ac.convertExprs(valueSpec.Values)
-				valueSpec.Values = newExprs
-				return gen
+
+		loc, ok := ctx.ces[expr]
+
+		if !ok || interruptedStmts[loc.stmt] {
+			return true
+		}
+
+		t := info.TypeOf(expr)
+		if t == nil {
+			interruptedStmts[loc.stmt] = true
+			return true
+		}
+
+		delete(ctx.ces, expr)
+
+		var names []string
+
+		switch v := t.(type) {
+		case *types.Named:
+			names = []string{"error"}
+		case *types.Tuple:
+			names = make([]string, v.Len())
+			for i := 0; i < v.Len(); i++ {
+				names[i] = sanitizeType(v.At(i).Type().String())
 			}
 		default:
-			return nil
+			panic(errors.New("return type must be Named or Tuple"))
 		}
-	case *ast.ExprStmt:
-		gen, newExpr := ac.convertExpr(v.X)
-		v.X = newExpr
-		return gen
-	case *ast.SendStmt:
-		// v.Chan too?
-		gen, newExpr := ac.convertExpr(v.Value)
-		v.Value = newExpr
-		return gen
-	case *ast.AssignStmt:
-		gen, newExprs := ac.convertExprs(v.Rhs)
-		v.Rhs = newExprs
-		return gen
-	case *ast.ReturnStmt:
-		gen, newExprs := ac.convertExprs(v.Results)
-		v.Results = newExprs
-		return gen
-	case *ast.BlockStmt:
-		ac.convertBlock(v)
 
-	case *ast.IfStmt:
-		ac.convertBlock(v.Body)
-		ac.convertStmt(v.Else)
-	case *ast.CaseClause:
-		for _, s := range v.Body {
-			ac.convertStmt(s)
+		if len(names) == 0 {
+			panic(errors.New("check expression evaluates to no values"))
 		}
-	case *ast.SwitchStmt:
-		ac.convertBlock(v.Body)
-	case *ast.TypeSwitchStmt:
-		ac.convertBlock(v.Body)
-	case *ast.CommClause:
-		for _, s := range v.Body {
-			ac.convertStmt(s)
+
+		if names[len(names)-1] != "error" {
+			panic(errors.New("last value of check expression must be error"))
 		}
-	case *ast.SelectStmt:
-		ac.convertBlock(v.Body)
-	case *ast.ForStmt:
-		ac.convertBlock(v.Body)
-	case *ast.RangeStmt:
-		ac.convertBlock(v.Body)
-	default:
-		return nil
+
+		//fmt.Printf("%#v\n", loc)
+		//fmt.Println(len(ctx.scopes))
+		scope := ctx.scopes[loc.block]
+		if scope != nil {
+			for i, name := range names {
+				names[i] = varPrefix + name + strconv.Itoa(scope[name])
+				scope[name]++
+			}
+		}
+
+		errName := names[len(names)-1]
+
+		switch v := c.Parent().(type) {
+		case *ast.CallExpr:
+			if len(names) > 2 {
+				args := names[0 : len(names)-1]
+				v.Args = toIdentExprs(args)
+			} else {
+				c.Replace(ast.NewIdent(names[0]))
+			}
+		case *ast.AssignStmt:
+			c.Replace(ast.NewIdent(names[0]))
+		case *ast.ExprStmt:
+			ctx.delExprStmts[v] = true
+			for i := range names[0 : len(names)-1] {
+				names[i] = "_"
+			}
+		case ast.Expr:
+			if len(names) < 2 {
+				panic(errors.New("check expression's parent must be call or assignment to have multiple values"))
+			}
+			c.Replace(ast.NewIdent(names[0]))
+		}
+
+		var hl []ast.Stmt
+		handlers := ctx.hcs[loc.fun]
+		numHandlers := ctx.snh[loc.stmt]
+		for i := numHandlers - 1; i >= 0; i-- {
+			h := astcopy.BlockStmt(handlers[i])
+			replaceIdent(h, ctx.handleErrNames[handlers[i]], errName)
+			hl = append(hl, h.List...)
+		}
+		defaultHandler := defaultHandleStmt2(loc.fun, info)
+		replaceIdent(defaultHandler, "err", errName)
+		hl = append(hl, defaultHandler)
+		//fmt.Printf("%#v\n\n\n", defaultHandleStmt2(loc.fun, info))
+		handleBody := &ast.BlockStmt{List: hl}
+		trimTerminatingStatements(handleBody)
+
+		genAssign := &ast.AssignStmt{
+			Lhs: toIdentExprs(names),
+			Tok: token.DEFINE,
+			Rhs: []ast.Expr{expr}, // is this copy alright?
+		}
+		genIf := &ast.IfStmt{
+			Cond: &ast.BinaryExpr{
+				X:  ast.NewIdent(names[len(names)-1]),
+				Op: token.NEQ,
+				Y:  ast.NewIdent("nil"),
+			},
+			Body: handleBody,
+		}
+
+		for i, stmt := range loc.block.List {
+			if stmt == loc.stmt {
+				loc.block.List = append(
+					loc.block.List[0:i],
+					append(
+						[]ast.Stmt{genAssign, genIf},
+						loc.block.List[i:]...,
+					)...,
+				)
+				break
+			}
+		}
+
+		fmt.Println(names)
+
+		return true
 	}
+
+	astutil.Apply(ctx.f, nil, postorder)
+	return len(ctx.ces)
+}
+
+func (ctx context) deleteExprStmts() {
+	astutil.Apply(ctx.f, func(c *astutil.Cursor) bool {
+		node := c.Node()
+		if node == nil {
+			return true
+		}
+		exprStmt, ok := node.(*ast.ExprStmt)
+		if !ok {
+			return true
+		}
+		if !ctx.delExprStmts[exprStmt] {
+			return true
+		}
+		c.Delete()
+		delete(ctx.delExprStmts, exprStmt)
+		return true
+	}, nil)
+}
+
+func transform(p *go2Package) error {
+	g := global{
+		ft:             make(funcTree),
+		bt:             make(blockTree),
+		hcs:            make(handleChains),
+		handleErrNames: make(map[*ast.BlockStmt]string),
+		snh:            make(stmtNumHandlers),
+		ces:            make(map[ast.Expr]checkLocation),
+		scopes:         make(scopeMap),
+		delExprStmts:   make(map[*ast.ExprStmt]bool),
+	}
+
+	for _, gf := range p.go2Files {
+		ctx := context{
+			go2File: gf,
+			global:  g,
+		}
+		ctx.buildTrees()
+	}
+
+	for _, gf := range p.go2Files {
+		ctx := context{
+			go2File: gf,
+			global:  g,
+		}
+		ctx.collectHandlersAndChecks()
+	}
+
+	prevRemaining := -1
+	for {
+		fmt.Println("--------")
+
+		info, err := p.checkTypes()
+		if err != nil {
+			return err
+		}
+
+		remaining := 0
+		for _, gf := range p.go2Files {
+			ctx := context{
+				go2File: gf,
+				global:  g,
+			}
+			remaining += ctx.consumeTypedChecks(info)
+			ctx.deleteExprStmts()
+		}
+
+		if remaining == 0 {
+			break
+		}
+		if remaining == prevRemaining {
+			fmt.Println("UNDEFINED TYPE")
+			break
+			//return errors.New("UNDEFINED TYPE")
+		}
+		prevRemaining = remaining
+	}
+
 	return nil
 }
 
-// returns generated code and altered expression list
-//
-// this is the only place where an exprList returned from convertCheck
-// isn't automatically "cast" to an Expr
-func (ac astContext) convertExprs(exprs []ast.Expr) ([]ast.Stmt, []ast.Expr) {
-	var generated []ast.Stmt
-	var newExprs []ast.Expr
-
-	for _, expr := range exprs {
-		if ac.isCheckExpr(expr) {
-			stmts, newExprList := ac.convertCheck(expr)
-			if len(newExprList) > 1 {
-				if len(exprs) > 1 {
-					panic(errors.New("error: multiple values in context where only one is allowed"))
-				}
-				return stmts, newExprList
-			}
-			generated = append(generated, stmts...)
-			newExprs = append(newExprs, newExprList...)
-			continue
-		}
-		stmts, newExpr := ac.convertExpr(expr)
-		generated = append(generated, stmts...)
-		newExprs = append(newExprs, newExpr)
-	}
-
-	return generated, newExprs
-}
-
-// returns generated code and altered expression
-//
-// This is the messiest convert* function, given the intense switch statement.
-// An astutil traversal (https://godoc.org/golang.org/x/tools/go/ast/astutil#Apply)
-// would likely have much less code, since I could traverse and replace nodes
-// generically. However, it would also make it harder to reason about the problem recursively.
-func (ac astContext) convertExpr(expr ast.Expr) ([]ast.Stmt, ast.Expr) {
-	if expr == nil {
-		return nil, nil
-	}
-
-	// function literal is special case: start new conversion
-	if funcLit, ok := expr.(*ast.FuncLit); ok {
-		ac.convertFunc(funcLit.Type, funcLit.Body)
-		return nil, expr
-	}
-
-	if ac.isCheckExpr(expr) {
-		gen, newExprList := ac.convertCheck(expr)
-		return gen, newExprList.Expr()
-	}
-
-	// https://golang.org/src/go/ast/ast.go#L227
-	switch v := expr.(type) {
-	case *ast.CompositeLit:
-		gen, newExprs := ac.convertExprs(v.Elts)
-		v.Elts = newExprs
-		return gen, v
-	case *ast.ParenExpr:
-		gen, newExpr := ac.convertExpr(v.X)
-		v.X = newExpr
-		return gen, v
-	case *ast.SelectorExpr:
-		gen, newExpr := ac.convertExpr(v.X)
-		v.X = newExpr
-		return gen, v
-	case *ast.IndexExpr:
-		var gens []ast.Stmt
-
-		gen, newExpr := ac.convertExpr(v.X)
-		gens = append(gens, gen...)
-		v.X = newExpr
-
-		gen, newExpr = ac.convertExpr(v.Index)
-		gens = append(gens, gen...)
-		v.Index = newExpr
-
-		return gens, v
-	case *ast.SliceExpr:
-		var gens []ast.Stmt
-
-		gen, newExpr := ac.convertExpr(v.Low)
-		gens = append(gens, gen...)
-		v.Low = newExpr
-
-		gen, newExpr = ac.convertExpr(v.High)
-		gens = append(gens, gen...)
-		v.High = newExpr
-
-		gen, newExpr = ac.convertExpr(v.Max)
-		gens = append(gens, gen...)
-		v.Max = newExpr
-
-		return gens, v
-	case *ast.TypeAssertExpr:
-		gen, newExpr := ac.convertExpr(v.X)
-		v.X = newExpr
-		return gen, v
-	case *ast.CallExpr:
-		var gens []ast.Stmt
-
-		gen, newExpr := ac.convertExpr(v.Fun)
-		gens = append(gens, gen...)
-		v.Fun = newExpr
-
-		gen, newExprs := ac.convertExprs(v.Args)
-		gens = append(gens, gen...)
-		v.Args = newExprs
-		return gen, v
-	case *ast.StarExpr:
-		gen, newExpr := ac.convertExpr(v.X)
-		v.X = newExpr
-		return gen, v
-	case *ast.UnaryExpr:
-		gen, newExpr := ac.convertExpr(v.X)
-		v.X = newExpr
-		return gen, v
-	case *ast.BinaryExpr:
-		var gens []ast.Stmt
-
-		gen, newExpr := ac.convertExpr(v.X)
-		gens = append(gens, gen...)
-		v.X = newExpr
-
-		gen, newExpr = ac.convertExpr(v.Y)
-		gens = append(gens, gen...)
-		v.Y = newExpr
-
-		return gens, v
-	case *ast.KeyValueExpr:
-		gen, newExpr := ac.convertExpr(v.Value)
-		v.Value = newExpr
-		return gen, v
+func isFunc(node ast.Node) bool {
+	switch node.(type) {
+	case *ast.FuncDecl:
+		return true
+	case *ast.FuncLit:
+		return true
 	default:
-		return nil, v
-	}
-}
-
-func (ac astContext) convertCheck(check ast.Expr) ([]ast.Stmt, exprList) {
-	//fmt.Printf("%#v\n", check)
-
-	pos := ac.nodePosDst(check) - ac.filePos + 1
-	delete(ac.checkMap, pos)
-	gen, expr := ac.convertExpr(check)
-
-	var resultTypes []string
-	exprCall, ok := expr.(*ast.CallExpr)
-	if ok {
-		var err error
-		resultTypes, err = resultTypeNames(ac.astInfo, exprCall)
-		if err != nil {
-			panic(err)
-		}
-		if len(resultTypes) == 0 {
-			panic(errors.New("check on func with no return values"))
-		}
-	} else {
-		resultTypes = []string{"error"}
-	}
-
-	if resultTypes[len(resultTypes)-1] != "error" {
-		panic(errors.New("last type of check expression must be error"))
-	}
-
-	varNames := make([]string, len(resultTypes))
-	for i, rt := range resultTypes {
-		curr := ac.varTypes[rt]
-		ac.varTypes[rt]++
-		varNames[i] = varPrefix + rt + strconv.Itoa(curr)
-	}
-
-	// need separate nodes to keep AST valid, especially if using github.com/dave/dst
-	varErr := &ast.Ident{Name: varNames[len(varNames)-1]}
-	varList := make([]ast.Expr, len(varNames))  // for generated code
-	varList2 := make([]ast.Expr, len(varNames)) // for returned exprList
-	for i, vn := range varNames {
-		varList[i] = &ast.Ident{Name: vn}
-		varList2[i] = &ast.Ident{Name: vn}
-	}
-
-	gen = append(gen, []ast.Stmt{
-		&ast.AssignStmt{
-			Lhs: varList,
-			Tok: token.DEFINE,
-			Rhs: []ast.Expr{expr},
-		},
-		&ast.IfStmt{
-			Cond: &ast.BinaryExpr{
-				X:  varErr,
-				Op: token.NEQ,
-				Y:  &ast.Ident{Name: "nil"},
-			},
-			Body: ac.evalHandleChain(varNames[len(varList)-1]),
-		},
-	}...)
-
-	// leave out error
-	return gen, exprList(varList2[0 : len(varList2)-1])
-}
-
-func (ac astContext) toHandleBlock(stmt ast.Stmt) (*ast.BlockStmt, bool) {
-	if stmt == nil {
-		return nil, false
-	}
-	pos := ac.nodePosDst(stmt) - ac.filePos + 1
-	if _, ok := ac.handleMap[pos]; ok {
-		return stmt.(*ast.BlockStmt), true
-	}
-	return nil, false
-}
-
-func (ac astContext) isCheckExpr(expr ast.Expr) bool {
-	if expr == nil {
 		return false
 	}
-	pos := ac.nodePosDst(expr) - ac.filePos + 1
-	str, err := ac.nodeStringDst(expr)
+}
+
+func toIdentExprs(names []string) []ast.Expr {
+	idents := make([]ast.Expr, len(names))
+	for i, name := range names {
+		idents[i] = &ast.Ident{Name: name}
+	}
+	return idents
+}
+
+/*
+func nodeString(node ast.Node) (string, error) {
+	var buf bytes.Buffer
+	err := ast.Fprint(&buf, node, nil)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
-	fmt.Printf("%d: %#v\n", pos, str)
-	if !ac.checkMap[pos] {
-		return false
-	}
-	//fmt.Printf("%#v\n", ac.checkMap)
-	switch expr.(type) {
-	case *ast.BinaryExpr, *ast.KeyValueExpr:
-		return false
-	}
-	return true
+	return buf.String(), nil
 }
+*/
 
-func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
+// fun must be *ast.FuncDecl or *ast.FuncLit
+func defaultHandleStmt2(fun ast.Node, info *types.Info) ast.Stmt {
+
+	var ft *ast.FuncType
+	switch v := fun.(type) {
+	case *ast.FuncDecl:
+		ft = v.Type
+	case *ast.FuncLit:
+		ft = v.Type
+	default:
+		panic("fun must be *ast.FuncDecl or *ast.FuncLit")
+	}
+
 	var ftrl []*ast.Field
 	if ft.Results != nil {
 		ftrl = ft.Results.List
@@ -482,7 +475,6 @@ func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 	}
 
 	last := ftrl[len(ftrl)-1]
-
 	lastIdent, ok := last.Type.(*ast.Ident)
 	if !ok || lastIdent.Name != "error" {
 		return panicWithErrStmt("err")
@@ -492,7 +484,7 @@ func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 	for i, field := range ft.Results.List {
 		if i < len(resultList)-1 {
 			resultList[i] = &ast.Ident{
-				Name: zeroValueString(ai, field.Type),
+				Name: zeroValueString(field.Type, info),
 			}
 		} else {
 			resultList[i] = &ast.Ident{
@@ -506,33 +498,6 @@ func defaultHandleStmt(ft *ast.FuncType, ai astInfo) ast.Stmt {
 	}
 }
 
-func replaceIdent(root ast.Node, old string, new string) {
-	ast.Inspect(root, func(node ast.Node) bool {
-		if ident, ok := node.(*ast.Ident); ok && ident.Name == old {
-			ident.Name = new
-		}
-		return true
-	})
-}
-
-func varDecl(name string, typeExpr ast.Expr) *ast.DeclStmt {
-	return &ast.DeclStmt{
-		Decl: &ast.GenDecl{
-			Tok: token.VAR,
-			Specs: []ast.Spec{
-				&ast.ValueSpec{
-					Names: []*ast.Ident{
-						&ast.Ident{
-							Name: name,
-						},
-					},
-					Type: typeExpr,
-				},
-			},
-		},
-	}
-}
-
 func panicWithErrStmt(errVar string) *ast.ExprStmt {
 	return &ast.ExprStmt{
 		X: &ast.CallExpr{
@@ -541,78 +506,6 @@ func panicWithErrStmt(errVar string) *ast.ExprStmt {
 				&ast.Ident{Name: errVar},
 			},
 		},
-	}
-}
-
-func resultTypeNames(ai astInfo, call *ast.CallExpr) ([]string, error) {
-	var ident *ast.Ident
-
-	switch v := call.Fun.(type) {
-	case *ast.FuncLit:
-		names := make([]string, len(v.Type.Results.List))
-		for i, field := range v.Type.Results.List {
-			s, err := ai.nodeStringDst(field.Type)
-			if err != nil {
-				return nil, err
-			}
-			names[i] = sanitizeType(s)
-		}
-		return names, nil
-	case *ast.SelectorExpr:
-		// TODO: LEFT OFF HERE, NEED TO ADD infoSelections* to dst.go
-		ident = v.Sel
-	case *ast.Ident:
-		ident = v
-	default:
-		return nil, errors.New("error: CallExpr.Fun not Ident|SelectorExpr|FuncLit")
-	}
-
-	obj, ok := ai.infoUsesDst(ident)
-	if !ok {
-		return nil, fmt.Errorf("error: object not found: %s", ident.Name)
-	}
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return nil, errors.New("error: object not a function")
-	}
-
-	l := sig.Results().Len()
-	names := make([]string, l)
-	for i := 0; i < l; i++ {
-		names[i] = sanitizeType(sig.Results().At(i).Type().String())
-	}
-	return names, nil
-}
-
-func zeroValueString(ai astInfo, typeExpr ast.Expr) string {
-	t := ai.infoTypeOfDst(typeExpr)
-	switch v := t.Underlying().(type) {
-	case *types.Basic:
-		switch v.Info() {
-		case types.IsBoolean:
-			return "false"
-		case types.IsString:
-			return `""`
-		default:
-			return "0"
-		}
-	case *types.Struct:
-		if ident, ok := typeExpr.(*ast.Ident); ok {
-			return ident.Name + "{}"
-		}
-		if selector, ok := typeExpr.(*ast.SelectorExpr); ok {
-			pkg, ok := selector.X.(*ast.Ident)
-			if !ok {
-				panic("struct type ast.SelectorExpr.X should be Ident (package name)")
-			}
-			return pkg.Name + "." + selector.Sel.Name + "{}"
-		}
-		if _, ok := typeExpr.(*ast.StructType); ok {
-			return v.String() + "{}"
-		}
-		panic(errors.New("struct type's corresponding ast expr should only be Ident or SelectorExpr"))
-	default:
-		return "nil"
 	}
 }
 
@@ -652,6 +545,47 @@ func trimTerminatingStatements(stmt ast.Stmt) bool {
 	default:
 		return false
 	}
+}
+
+func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
+	t := info.TypeOf(typeExpr)
+	switch v := t.Underlying().(type) {
+	case *types.Basic:
+		switch v.Info() {
+		case types.IsBoolean:
+			return "false"
+		case types.IsString:
+			return `""`
+		default:
+			return "0"
+		}
+	case *types.Struct:
+		if ident, ok := typeExpr.(*ast.Ident); ok {
+			return ident.Name + "{}"
+		}
+		if selector, ok := typeExpr.(*ast.SelectorExpr); ok {
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok {
+				panic("struct type ast.SelectorExpr.X should be Ident (package name)")
+			}
+			return pkg.Name + "." + selector.Sel.Name + "{}"
+		}
+		if _, ok := typeExpr.(*ast.StructType); ok {
+			return v.String() + "{}"
+		}
+		panic(errors.New("struct type's corresponding ast expr should only be Ident or SelectorExpr"))
+	default:
+		return "nil"
+	}
+}
+
+func replaceIdent(root ast.Node, old string, new string) {
+	ast.Inspect(root, func(node ast.Node) bool {
+		if ident, ok := node.(*ast.Ident); ok && ident.Name == old {
+			ident.Name = new
+		}
+		return true
+	})
 }
 
 // replaces *, [], and [N] from type name

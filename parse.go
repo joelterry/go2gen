@@ -13,30 +13,32 @@ import (
 	"path"
 )
 
-type processedFile struct {
-	*ast.File
-	checkMap
-	handleMap
+type go2Package struct {
 	name string
+
+	fset *token.FileSet
+
+	// Not sure how to preserve an intermediate
+	// token.FileSet for repeated use, so for now
+	// I'm storing the .go files as *dst.File,
+	// even though I'm not modifying them at all.
+	goFiles []*ast.File
+
+	go2Files []*go2File
 }
 
-func parseString(s string) (ast.Node, error) {
-	return parser.ParseFile(token.NewFileSet(), "", s, 0)
-}
-
-func parseDir(dirPath string, fset *token.FileSet) ([]processedFile, *types.Info, error) {
+func parsePkg(dirPath string) (*go2Package, error) {
 	pkg, err := build.ImportDir(dirPath, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-
 	dir, err := os.Open(dirPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	files, err := dir.Readdirnames(0)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	isGo2 := make(map[string]bool)
@@ -48,8 +50,9 @@ func parseDir(dirPath string, fset *token.FileSet) ([]processedFile, *types.Info
 		}
 	}
 
-	var allFiles []*ast.File
-	var go2Files []processedFile
+	fset := token.NewFileSet()
+	var goFiles []*ast.File
+	var go2Files []*go2File
 
 	for _, file := range files {
 
@@ -68,37 +71,60 @@ func parseDir(dirPath string, fset *token.FileSet) ([]processedFile, *types.Info
 		if ext == ".go" && !isGo2[name] {
 			f, err := parser.ParseFile(fset, fullPath, nil, 0)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
-			allFiles = append(allFiles, f)
+			goFiles = append(goFiles, f)
 			continue
 		}
 
 		b, err := ioutil.ReadFile(fullPath)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		src, cm, hm, err := process(string(b))
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
-		f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+		f, err := parser.ParseFile(fset, "", src, 0)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
+		}
+		original, err := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments)
+		if err != nil {
+			return nil, err
 		}
 
-		allFiles = append(allFiles, f)
-		go2Files = append(go2Files, processedFile{
-			File:      f,
+		/*
+			fmt.Printf("%v\n", f)
+			fmt.Printf("%v\n", original)
+		*/
+
+		go2Files = append(go2Files, &go2File{
+			name:      name,
+			fset:      fset,
+			f:         f,
 			checkMap:  cm,
 			handleMap: hm,
-			name:      name,
+			original:  original,
 		})
 	}
 
-	// https://github.com/golang/example/tree/master/gotypes#identifier-resolution
+	return &go2Package{
+		name:     pkg.Name,
+		fset:     fset,
+		goFiles:  goFiles,
+		go2Files: go2Files,
+	}, nil
+}
+
+func (p *go2Package) checkTypes() (*types.Info, error) {
+	var files []*ast.File
+	files = append(files, p.goFiles...)
+	for _, gf := range p.go2Files {
+		files = append(files, gf.f)
+	}
 	cfg := &types.Config{
 		Error:    func(err error) { log.Println(err) },
 		Importer: importer.Default(),
@@ -111,7 +137,10 @@ func parseDir(dirPath string, fset *token.FileSet) ([]processedFile, *types.Info
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 		Scopes:     make(map[ast.Node]*types.Scope),
 	}
-	cfg.Check(pkg.Name, fset, allFiles, info)
+	cfg.Check(p.name, p.fset, files, info)
+	return info, nil
+}
 
-	return go2Files, info, nil
+func parseString(s string) (ast.Node, error) {
+	return parser.ParseFile(token.NewFileSet(), "", s, 0)
 }

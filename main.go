@@ -1,12 +1,9 @@
 package main
 
 import (
-	"go/token"
 	"log"
 	"os"
 	"path"
-
-	"github.com/dave/dst/decorator"
 )
 
 const (
@@ -41,34 +38,25 @@ func main() {
 }
 
 func generate(dir string) error {
-	fset := token.NewFileSet()
-	fm, info, err := parseDir(dir, fset)
+	pkg, err := parsePkg(dir)
 	if err != nil {
 		return err
 	}
 
-	dec := decorator.NewDecorator(fset)
-	ai := astInfo{
-		fset: fset,
-		info: info,
-		dec:  dec,
-	}
-	ac := astContext{
-		astInfo: ai,
+	err = transform(pkg)
+	if err != nil {
+		return err
 	}
 
-	for _, pf := range fm {
-		df, err := dec.DecorateFile(pf.File)
+	/*
+		err = pkg.applyComments()
 		if err != nil {
 			return err
 		}
+	*/
 
-		err = ac.convertFile(df, pf.checkMap, pf.handleMap)
-
-		if err != nil {
-			return err
-		}
-		w, err := os.Create(path.Join(dir, pf.name) + ".go")
+	for _, gf := range pkg.go2Files {
+		w, err := os.Create(path.Join(dir, gf.name) + ".go")
 		if err != nil {
 			return err
 		}
@@ -76,11 +64,55 @@ func generate(dir string) error {
 		if err != nil {
 			return err
 		}
-		err = ai.writeFileDst(w, df)
+		str, err := gf.string()
 		if err != nil {
 			return err
 		}
+		_, err = w.WriteString(str)
+		if err != nil {
+			return err
+		}
+		//err = format.Node(w, pkg.fset, gf.f)
+		//err = decorator.Fprint(w, gf.output)
 	}
+
+	/*
+		dec := decorator.NewDecorator(fset)
+		ai := astInfo{
+			fset: fset,
+			info: info,
+			dec:  dec,
+		}
+		ac := astContext{
+			astInfo: ai,
+		}
+
+		for _, pf := range fm {
+			df, err := dec.DecorateFile(pf.File)
+			if err != nil {
+				return err
+			}
+
+			err = ac.convertFile(df, pf.checkMap, pf.handleMap)
+
+			if err != nil {
+				return err
+			}
+
+			w, err := os.Create(path.Join(dir, pf.name) + ".go")
+			if err != nil {
+				return err
+			}
+			_, err = w.WriteString(generatedComment + "\n\n")
+			if err != nil {
+				return err
+			}
+			err = ai.writeFileDst(w, df)
+			if err != nil {
+				return err
+			}
+		}
+	*/
 
 	return nil
 }
