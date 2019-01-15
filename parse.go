@@ -96,11 +96,6 @@ func parsePkg(dirPath string) (*go2Package, error) {
 			return nil, err
 		}
 
-		/*
-			fmt.Printf("%v\n", f)
-			fmt.Printf("%v\n", original)
-		*/
-
 		go2Files = append(go2Files, &go2File{
 			name:      name,
 			fset:      fset,

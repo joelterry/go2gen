@@ -16,11 +16,6 @@ const (
 )
 
 func main() {
-	/*
-		ProcessFile("foo/foo.go2", "foo/foo.go3")
-		return
-	*/
-
 	var dir string
 	var err error
 	if len(os.Args) > 1 {
@@ -48,13 +43,6 @@ func generate(dir string) error {
 		return err
 	}
 
-	/*
-		err = pkg.applyComments()
-		if err != nil {
-			return err
-		}
-	*/
-
 	for _, gf := range pkg.go2Files {
 		w, err := os.Create(path.Join(dir, gf.name) + ".go")
 		if err != nil {
@@ -72,47 +60,7 @@ func generate(dir string) error {
 		if err != nil {
 			return err
 		}
-		//err = format.Node(w, pkg.fset, gf.f)
-		//err = decorator.Fprint(w, gf.output)
 	}
-
-	/*
-		dec := decorator.NewDecorator(fset)
-		ai := astInfo{
-			fset: fset,
-			info: info,
-			dec:  dec,
-		}
-		ac := astContext{
-			astInfo: ai,
-		}
-
-		for _, pf := range fm {
-			df, err := dec.DecorateFile(pf.File)
-			if err != nil {
-				return err
-			}
-
-			err = ac.convertFile(df, pf.checkMap, pf.handleMap)
-
-			if err != nil {
-				return err
-			}
-
-			w, err := os.Create(path.Join(dir, pf.name) + ".go")
-			if err != nil {
-				return err
-			}
-			_, err = w.WriteString(generatedComment + "\n\n")
-			if err != nil {
-				return err
-			}
-			err = ai.writeFileDst(w, df)
-			if err != nil {
-				return err
-			}
-		}
-	*/
 
 	return nil
 }

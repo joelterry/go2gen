@@ -442,17 +442,6 @@ func toIdentExprs(names []string) []ast.Expr {
 	return idents
 }
 
-/*
-func nodeString(node ast.Node) (string, error) {
-	var buf bytes.Buffer
-	err := ast.Fprint(&buf, node, nil)
-	if err != nil {
-		return "", err
-	}
-	return buf.String(), nil
-}
-*/
-
 // fun must be *ast.FuncDecl or *ast.FuncLit
 func defaultHandleStmt2(fun ast.Node, info *types.Info) ast.Stmt {
 
