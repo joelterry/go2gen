@@ -14,6 +14,10 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 )
 
+const (
+	defaultHandlerErrName = "err"
+)
+
 type go2File struct {
 	name string
 	fset *token.FileSet
@@ -390,6 +394,11 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 			h := astcopy.BlockStmt(handler)
 			replaceIdent(h, tc.handlerErrNames[handler], errName)
 			hl = append(hl, h.List...)
+		}
+		defaultHandler := defaultHandleStmt2(checkInfo.fun, info)
+		if defaultHandler != nil {
+			replaceIdent(defaultHandler, defaultHandlerErrName, errName)
+			hl = append(hl, defaultHandler)
 		}
 		handleBody := &ast.BlockStmt{List: hl}
 		trimTerminatingStatements(handleBody)

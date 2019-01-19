@@ -43,13 +43,13 @@ func defaultHandleStmt2(fun ast.Node, info *types.Info) ast.Stmt {
 		ftrl = ft.Results.List
 	}
 	if len(ftrl) == 0 {
-		return panicWithErrStmt("err")
+		return nil
 	}
 
 	last := ftrl[len(ftrl)-1]
 	lastIdent, ok := last.Type.(*ast.Ident)
 	if !ok || lastIdent.Name != "error" {
-		return panicWithErrStmt("err")
+		return nil
 	}
 
 	resultList := make([]ast.Expr, len(ft.Results.List))
