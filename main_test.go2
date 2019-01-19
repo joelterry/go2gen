@@ -1,0 +1,60 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"path"
+	"io/ioutil"
+)
+
+const (
+	testInputDir  = "test/input"
+	testOutputDir = "test/output"
+)
+
+func TestMain(t *testing.T) {
+	handle err {
+		fmt.Println(err)
+		t.FailNow()
+		return
+	}
+
+	inputDir := check os.Open(testInputDir)
+	outputDir := check os.Open(testOutputDir)
+
+	inputNames := check inputDir.Readdirnames(0)
+	outputNames := check outputDir.Readdirnames(0)
+
+	inputGo := make(map[string]bool)
+	inputGo2 := make(map[string]bool)
+	for _, name := range inputNames {
+		switch path.Ext(name) {
+		case ".go":
+			inputGo[name] = true
+		case ".go2":
+			inputGo2[name] = true
+		}
+	}
+
+	// remove all .go files that correspond with .go2 files, if they exist
+	for goName := range inputGo {
+		if inputGo2[goName] {
+			check os.Remove(path.Join(testInputDir, goName))
+		}
+	}
+
+	check generate(testInputDir)
+
+	for _, name := range outputNames {
+		result := string(check ioutil.ReadFile(path.Join(testInputDir, name)))
+		correct := string(check ioutil.ReadFile(path.Join(testOutputDir, name)))
+		if inputGo2[name] {
+			correct = generatedComment + "\n\n" + string(correct)	
+		}
+		if result != correct {
+			fmt.Println("mismatch: ", name)
+			t.Fail()
+		}
+	}
+}

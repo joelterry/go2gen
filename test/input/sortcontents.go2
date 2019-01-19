@@ -1,0 +1,32 @@
+package test
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+)
+
+func SortContents(w io.Writer, files []string) error {
+    handle err {
+        return fmt.Errorf("process: %v", err)             // handler A
+    }
+
+    lines := []string{}
+    for _, file := range files {
+        handle err {
+            return fmt.Errorf("read %s: %v ", file, err)  // handler B
+        }
+        scan := bufio.NewScanner(check os.Open(file))     // check runs B on error
+        for scan.Scan() {
+            lines = append(lines, scan.Text())
+        }
+        check scan.Err()                                  // check runs B on error
+    }
+    sort.Strings(lines)
+    for _, line := range lines {
+        check io.WriteString(w, line)                     // check runs A on error
+	}
+	return nil
+}

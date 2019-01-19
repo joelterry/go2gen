@@ -1,0 +1,37 @@
+package test
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func printSum1(a, b string) error {
+	handle err { return err }
+	x := check strconv.Atoi(a)
+	y := check strconv.Atoi(b)
+	fmt.Println("result:", x + y)
+	return nil
+}
+
+func printSum2(a, b string) error {
+	handle err { return err }
+	fmt.Println("result:", check strconv.Atoi(a) + check strconv.Atoi(b))
+	return nil
+}
+
+func printSum3(a, b string) error {
+	handle err {
+		return fmt.Errorf("printSum(%q + %q): %v", a, b, err)
+	}
+	x := check strconv.Atoi(a)
+	y := check strconv.Atoi(b)
+	fmt.Println("result:", x + y)
+	return nil
+}
+
+func printSum4(a, b string) error {
+	x := check strconv.Atoi(a)
+	y := check strconv.Atoi(b)
+	fmt.Println("result:", x + y)
+	return nil
+}

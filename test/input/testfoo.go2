@@ -1,0 +1,29 @@
+package test 
+
+import (
+	"testing"
+)
+
+var testCases []testCase
+
+type testCase struct {
+	a string
+	b string
+}
+
+func Foo(s string) (int, error) {
+	return 0, nil
+}
+
+func TestFoo(t *testing.T) {
+	// NOTE: the following draft example with t.Helper() 
+	// doesn't make sense given current implementation
+	handle err { t.Fatal(err) }
+	for _, tc := range testCases {
+		x := check Foo(tc.a)
+		y := check Foo(tc.b)
+		if x != y {
+			t.Errorf("Foo(%v) != Foo(%v)", tc.a, tc.b)
+		}
+	}
+}

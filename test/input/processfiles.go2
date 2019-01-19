@@ -1,0 +1,41 @@
+package test
+
+import (
+	"os"
+)
+
+func process2(f *os.File) error {
+	return nil
+}
+
+type User int
+
+func (u User) Close() {}
+
+func OpenUserInfo(s string) (User, error) {
+	return 0, nil
+}
+
+type Error struct {
+	Func string
+	User string
+	Path string
+	Err  error
+}
+
+func (e *Error) Error() string {
+	return ""
+}
+
+func ProcessFiles(user string, files chan string) error {
+	e := Error{ Func: "ProcessFile", User: user}
+	handle err { e.Err = err; return &e } // handler A
+	u := check OpenUserInfo(user)         // check 1
+	defer u.Close()
+	for file := range files {
+		handle err { e.Path = file }       // handler B
+		check process2(check os.Open(file)) // check 2
+	}
+	// ... 
+	return nil
+}

@@ -1,0 +1,33 @@
+package test
+
+import (
+	"fmt"
+)
+
+func something() error {
+	return nil
+}
+
+func somethingElse() error {
+	return nil
+}
+
+func do(e error) error {
+	return e
+}
+
+func moreWrapping(e error) error {
+	return e
+}
+
+func process(user string, files chan string) (n int, err error) {
+    handle err { return 0, fmt.Errorf("process: %v", err)  }      // handler A
+    for i := 0; i < 3; i++ {
+        handle err { err = fmt.Errorf("attempt %d: %v", i, err) } // handler B
+        handle err { err = moreWrapping(err) }                    // handler C
+
+        check do(something())  // check 1: handler chain C, B, A
+    }
+	check do(somethingElse())  // check 2: handler chain A
+	return // NOTE: not in example, I assume it's an error
+}
