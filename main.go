@@ -38,7 +38,7 @@ func generate(dir string) error {
 		return err
 	}
 
-	err = transform(pkg)
+	err = transform2(pkg)
 	if err != nil {
 		return err
 	}
