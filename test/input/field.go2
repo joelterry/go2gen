@@ -1,0 +1,19 @@
+package test
+
+import (
+	"fmt"
+)
+
+func field() error {
+	x := struct{
+		a int
+		b int
+	}{
+		a: 10,
+		b: check func() (int, error) {
+			return 20, nil
+		}(),
+	}
+	fmt.Println(x)
+	return nil
+}

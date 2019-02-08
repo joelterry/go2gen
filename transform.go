@@ -331,7 +331,7 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 		}
 
 		t := info.TypeOf(expr)
-		if t == nil {
+		if !isDefined(t) {
 			stmtInterrupted[checkInfo.stmt] = true
 			return true
 		}

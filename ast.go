@@ -119,6 +119,27 @@ func trimTerminatingStatements(stmt ast.Stmt) bool {
 	}
 }
 
+func isDefined(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch v := t.(type) {
+	case *types.Basic:
+		return v.Kind() != types.Invalid
+	case *types.Tuple:
+		l := v.Len()
+		for i := 0; i < l; i++ {
+			item := v.At(i)
+			if !isDefined(item.Type()) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
 func zeroValueString(typeExpr ast.Expr, info *types.Info) string {
 	t := info.TypeOf(typeExpr)
 	switch v := t.Underlying().(type) {
