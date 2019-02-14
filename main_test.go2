@@ -39,7 +39,7 @@ func TestMain(t *testing.T) {
 
 	// remove all .go files that correspond with .go2 files, if they exist
 	for goName := range inputGo {
-		if inputGo2[goName] {
+		if inputGo2[goName + "2"] {
 			check os.Remove(path.Join(testInputDir, goName))
 		}
 	}

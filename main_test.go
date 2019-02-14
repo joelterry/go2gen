@@ -16,34 +16,34 @@ const (
 )
 
 func TestMain(t *testing.T) {
-	_go2pointerosFile0, _go2error0 := os.Open(testInputDir)
+	_go2ptrFile0, _go2error0 := os.Open(testInputDir)
 	if _go2error0 != nil {
 		fmt.Println(_go2error0)
 		t.FailNow()
 		return
 	}
-	inputDir := _go2pointerosFile0
-	_go2pointerosFile1, _go2error1 := os.Open(testOutputDir)
+	inputDir := _go2ptrFile0
+	_go2ptrFile1, _go2error1 := os.Open(testOutputDir)
 	if _go2error1 != nil {
 		fmt.Println(_go2error1)
 		t.FailNow()
 		return
 	}
-	outputDir := _go2pointerosFile1
-	_go2slicestring0, _go2error3 := inputDir.Readdirnames(0)
+	outputDir := _go2ptrFile1
+	_go2slcString0, _go2error2 := inputDir.Readdirnames(0)
+	if _go2error2 != nil {
+		fmt.Println(_go2error2)
+		t.FailNow()
+		return
+	}
+	inputNames := _go2slcString0
+	_go2slcString1, _go2error3 := outputDir.Readdirnames(0)
 	if _go2error3 != nil {
 		fmt.Println(_go2error3)
 		t.FailNow()
 		return
 	}
-	inputNames := _go2slicestring0
-	_go2slicestring1, _go2error4 := outputDir.Readdirnames(0)
-	if _go2error4 != nil {
-		fmt.Println(_go2error4)
-		t.FailNow()
-		return
-	}
-	outputNames := _go2slicestring1
+	outputNames := _go2slcString1
 	inputGo := make(map[string]bool)
 	inputGo2 := make(map[string]bool)
 	for _, name := range inputNames {
@@ -55,7 +55,7 @@ func TestMain(t *testing.T) {
 		}
 	}
 	for goName := range inputGo {
-		if inputGo2[goName] {
+		if inputGo2[goName+"2"] {
 			_go2error0 := os.Remove(path.Join(testInputDir, goName))
 			if _go2error0 != nil {
 				fmt.Println(_go2error0)
@@ -64,27 +64,27 @@ func TestMain(t *testing.T) {
 			}
 		}
 	}
-	_go2error2 := generate(testInputDir)
-	if _go2error2 != nil {
-		fmt.Println(_go2error2)
+	_go2error4 := generate(testInputDir)
+	if _go2error4 != nil {
+		fmt.Println(_go2error4)
 		t.FailNow()
 		return
 	}
 	for _, name := range outputNames {
-		_go2slicebyte0, _go2error0 := ioutil.ReadFile(path.Join(testInputDir, name))
+		_go2slcByte0, _go2error0 := ioutil.ReadFile(path.Join(testInputDir, name))
 		if _go2error0 != nil {
 			fmt.Println(_go2error0)
 			t.FailNow()
 			return
 		}
-		result := string(_go2slicebyte0)
-		_go2slicebyte1, _go2error1 := ioutil.ReadFile(path.Join(testOutputDir, name))
+		result := string(_go2slcByte0)
+		_go2slcByte1, _go2error1 := ioutil.ReadFile(path.Join(testOutputDir, name))
 		if _go2error1 != nil {
 			fmt.Println(_go2error1)
 			t.FailNow()
 			return
 		}
-		correct := string(_go2slicebyte1)
+		correct := string(_go2slcByte1)
 		if inputGo2[name] {
 			correct = generatedComment + "\n\n" + string(correct)
 		}

@@ -215,7 +215,7 @@ func lexicalStmtTree(root ast.Node, info treeInfo) stmtTree {
 	return st
 }
 
-func collectChecksAndHandles2(gf *go2File, handlerErrNames map[*ast.BlockStmt]string) []ast.Expr {
+func collectChecksAndHandles(gf *go2File, handlerErrNames map[*ast.BlockStmt]string) []ast.Expr {
 
 	var checks []ast.Expr
 	checkCollected := make(map[token.Pos]bool)
@@ -431,8 +431,6 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 			}
 		}
 
-		fmt.Println(names)
-
 		return true
 	})
 }
@@ -456,22 +454,20 @@ func (tc transformContext) deleteExprStmts(gf *go2File) {
 	}, nil)
 }
 
-func transform2(p *go2Package) error {
+func transform(p *go2Package) error {
 
 	tc := newTransformContext()
 
 	for _, gf := range p.go2Files {
 		ti := buildTreeInfo(gf.f)
 		lst := lexicalStmtTree(gf.f, ti)
-		checks := collectChecksAndHandles2(gf, tc.handlerErrNames)
+		checks := collectChecksAndHandles(gf, tc.handlerErrNames)
 		tc.buildHandlerChains(gf, ti, lst, checks)
 	}
 
 	prevRemaining := len(tc.checks)
 	for {
-		fmt.Println("----------")
-
-		info, err := p.checkTypes()
+		info, err := p.checkTypes(nil)
 		if err != nil {
 			return err
 		}
@@ -485,7 +481,7 @@ func transform2(p *go2Package) error {
 			break
 		}
 		if len(tc.checks) == prevRemaining {
-			fmt.Println("UNDEFINED TYPE")
+			fmt.Println("ERROR: failed to complete code generation; .go2 code is likely incorrect")
 			break
 		}
 		prevRemaining = len(tc.checks)

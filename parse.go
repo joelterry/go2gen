@@ -8,7 +8,6 @@ import (
 	"go/token"
 	"go/types"
 	"io/ioutil"
-	"log"
 	"os"
 	"path"
 )
@@ -114,14 +113,14 @@ func parsePkg(dirPath string) (*go2Package, error) {
 	}, nil
 }
 
-func (p *go2Package) checkTypes() (*types.Info, error) {
+func (p *go2Package) checkTypes(errFn func(error)) (*types.Info, error) {
 	var files []*ast.File
 	files = append(files, p.goFiles...)
 	for _, gf := range p.go2Files {
 		files = append(files, gf.f)
 	}
 	cfg := &types.Config{
-		Error:    func(err error) { log.Println(err) },
+		Error:    errFn,
 		Importer: importer.Default(),
 	}
 	info := &types.Info{
