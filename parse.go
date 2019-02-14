@@ -1,8 +1,8 @@
 package main
 
 import (
+	"errors"
 	"go/ast"
-	"go/build"
 	"go/importer"
 	"go/parser"
 	"go/token"
@@ -27,10 +27,8 @@ type go2Package struct {
 }
 
 func parsePkg(dirPath string) (*go2Package, error) {
-	pkg, err := build.ImportDir(dirPath, 0)
-	if err != nil {
-		return nil, err
-	}
+	pkgName := ""
+
 	dir, err := os.Open(dirPath)
 	if err != nil {
 		return nil, err
@@ -72,6 +70,17 @@ func parsePkg(dirPath string) (*go2Package, error) {
 			if err != nil {
 				return nil, err
 			}
+
+			// get package name from *ast.File
+			if f.Name == nil {
+				return nil, errors.New("missing package declaration")
+			}
+			if pkgName == "" {
+				pkgName = f.Name.Name
+			} else if pkgName != f.Name.Name {
+				return nil, errors.New("mismatched package declarations")
+			}
+
 			goFiles = append(goFiles, f)
 			continue
 		}
@@ -90,9 +99,14 @@ func parsePkg(dirPath string) (*go2Package, error) {
 		if err != nil {
 			return nil, err
 		}
-		original, err := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments)
-		if err != nil {
-			return nil, err
+		// get package name from *ast.File
+		if f.Name == nil {
+			return nil, errors.New("missing package declaration")
+		}
+		if pkgName == "" {
+			pkgName = f.Name.Name
+		} else if pkgName != f.Name.Name {
+			return nil, errors.New("mismatched package declarations")
 		}
 
 		go2Files = append(go2Files, &go2File{
@@ -101,12 +115,11 @@ func parsePkg(dirPath string) (*go2Package, error) {
 			f:         f,
 			checkMap:  cm,
 			handleMap: hm,
-			original:  original,
 		})
 	}
 
 	return &go2Package{
-		name:     pkg.Name,
+		name:     pkgName,
 		fset:     fset,
 		goFiles:  goFiles,
 		go2Files: go2Files,

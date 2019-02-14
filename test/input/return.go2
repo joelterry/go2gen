@@ -1,0 +1,10 @@
+package test
+
+import (
+	"io/ioutil"
+)
+
+func ReturnStmt() []byte {
+	handle err { panic(err) }
+	return check ioutil.ReadFile("path")
+}

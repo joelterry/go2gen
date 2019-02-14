@@ -24,8 +24,6 @@ type go2File struct {
 	f    *ast.File
 	checkMap
 	handleMap
-
-	original *ast.File
 }
 
 func (gf go2File) pos(node ast.Node) token.Pos {
@@ -375,7 +373,8 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 			} else {
 				c.Replace(ast.NewIdent(names[0]))
 			}
-		case *ast.AssignStmt:
+		// NOTE: missing tuple case here?
+		case *ast.AssignStmt, *ast.ReturnStmt:
 			c.Replace(ast.NewIdent(names[0]))
 		case *ast.ExprStmt:
 			tc.toDelete[v] = true
@@ -431,6 +430,8 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 			}
 		}
 
+		fmt.Println(names)
+
 		return true
 	})
 }
@@ -467,7 +468,8 @@ func transform(p *go2Package) error {
 
 	prevRemaining := len(tc.checks)
 	for {
-		info, err := p.checkTypes(nil)
+		fmt.Println("------------")
+		info, err := p.checkTypes(func(err error) { fmt.Println(err) })
 		if err != nil {
 			return err
 		}
