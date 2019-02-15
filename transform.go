@@ -444,7 +444,8 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 			}
 		}
 
-		fmt.Println(names)
+		// Print generated variable names; Uncomment to debug; add verbose mode?
+		// fmt.Println(names)
 
 		return true
 	})
@@ -482,8 +483,11 @@ func transform(p *go2Package) error {
 
 	prevRemaining := len(tc.checks)
 	for {
-		fmt.Println("------------")
-		info, err := p.checkTypes(func(err error) { fmt.Println(err) })
+		// Print type check errors (which are to be expected, except for on last pass).
+		// Uncomment to debug; add verbose mode?
+		// fmt.Println("------------")
+		// info, err := p.checkTypes(func(err error) { fmt.Println(err) })
+		info, err := p.checkTypes(nil)
 		if err != nil {
 			return err
 		}
