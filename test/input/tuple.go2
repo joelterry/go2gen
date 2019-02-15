@@ -1,0 +1,20 @@
+package test
+
+import "fmt"
+
+func multiIn(string, int, bool) {}
+
+func multiOut() (string, int, bool, error) {
+	return "", 0, false, nil
+}
+
+func tuples() (string, int, bool) {
+	handle err { panic(err) }
+
+	s, i, b := check multiOut()
+	fmt.Println(s, i, b)
+
+	multiIn(check multiOut())
+
+	return check multiOut()
+}

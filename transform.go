@@ -366,6 +366,8 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 		errName := names[len(names)-1]
 
 		switch v := c.Parent().(type) {
+
+		// CallExpr, AssignStmt, ReturnStmt: potential tuples
 		case *ast.CallExpr:
 			if len(names) > 2 {
 				args := names[0 : len(names)-1]
@@ -373,9 +375,21 @@ func (tc transformContext) consumeTypedChecks(gf *go2File, info *types.Info) {
 			} else {
 				c.Replace(ast.NewIdent(names[0]))
 			}
-		// NOTE: missing tuple case here?
-		case *ast.AssignStmt, *ast.ReturnStmt:
-			c.Replace(ast.NewIdent(names[0]))
+		case *ast.AssignStmt:
+			if len(names) > 2 {
+				args := names[0 : len(names)-1]
+				v.Rhs = toIdentExprs(args)
+			} else {
+				c.Replace(ast.NewIdent(names[0]))
+			}
+		case *ast.ReturnStmt:
+			if len(names) > 2 {
+				args := names[0 : len(names)-1]
+				v.Results = toIdentExprs(args)
+			} else {
+				c.Replace(ast.NewIdent(names[0]))
+			}
+
 		case *ast.ExprStmt:
 			tc.toDelete[v] = true
 			for i := range names[0 : len(names)-1] {
